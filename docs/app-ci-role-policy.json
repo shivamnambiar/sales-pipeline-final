@@ -1,0 +1,63 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRRegistry",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:DescribeRegistry"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPush",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:DescribeImages"
+      ],
+      "Resource": [
+        "arn:aws:ecr:*:*:repository/sales-pipeline-api",
+        "arn:aws:ecr:*:*:repository/sales-pipeline-worker"
+      ]
+    },
+    {
+      "Sid": "CodeBuildArgoCDRefresh",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:StartBuild",
+        "codebuild:BatchGetBuilds",
+        "codebuild:StopBuild"
+      ],
+      "Resource": [
+        "arn:aws:codebuild:*:*:project/sales-pipeline-argocd-refresh"
+      ]
+    },
+    {
+      "Sid": "DenyBuildspecOverride",
+      "Effect": "Deny",
+      "Action": "codebuild:StartBuild",
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "codebuild:source.buildspec": "false"
+        }
+      }
+    },
+    {
+      "Sid": "CodeBuildArgoCDRefreshLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:GetLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:*:*:log-group:/aws/codebuild/sales-pipeline-argocd-refresh:*"
+      ]
+    }
+  ]
+}

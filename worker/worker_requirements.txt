@@ -1,0 +1,4 @@
+sqlalchemy==2.0.46
+psycopg2-binary==2.9.10
+boto3==1.36.0
+prometheus-client==0.21.0

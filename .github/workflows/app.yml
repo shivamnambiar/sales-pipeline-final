@@ -1,0 +1,162 @@
+name: app
+
+on:
+  pull_request:
+    paths:
+      - "api/**"
+      - "worker/**"
+      - ".github/workflows/app.yml"
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "worker/**"
+      - ".github/workflows/app.yml"
+
+concurrency:
+  group: app-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ARGOCD_REFRESH_PROJECT: sales-pipeline-argocd-refresh
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install + test api
+        run: |
+          pip install -r api/api_requirements.txt "moto[server]" httpx
+          cd api && python smoke_test.py
+
+      - name: install + test worker
+        run: |
+          pip install -r worker/worker_requirements.txt "moto[server]"
+          cd worker && python test_processing.py && python integration_test.py
+
+  build:
+    permissions:
+      id-token: write
+      contents: read
+    name: build, scan, push
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api, worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: |
+          docker build -t ${{ matrix.service }}:${{ github.sha }} -f ./${{ matrix.service }}/Dockerfile.${{ matrix.service }} ./${{ matrix.service }}
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.service }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Tag + push to ECR
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          REPO="$REGISTRY/sales-pipeline-${{ matrix.service }}"
+          if aws ecr describe-images --repository-name "sales-pipeline-${{ matrix.service }}" \
+               --image-ids imageTag=${{ github.sha }} >/dev/null 2>&1; then
+            echo "tag ${{ github.sha }} already in ECR (job re-run) - skipping; same SHA is same content"
+          else
+            docker tag ${{ matrix.service }}:${{ github.sha }} "$REPO:${{ github.sha }}"
+            docker push "$REPO:${{ github.sha }}"
+          fi
+
+  deploy:
+    permissions:
+      id-token: write
+      contents: write
+    name: deploy to EKS
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kustomize (pinned v5.4.3)
+        run: |
+          curl -sfLo kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz
+          tar -xzf kustomize.tar.gz && sudo mv kustomize /usr/local/bin/
+
+      - name: Pin image tags in the overlay (Git stays source of truth)
+        run: |
+          REGISTRY=$(aws ecr describe-registry --query registryId --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          cd k8s/overlays/prod
+          kustomize edit set image \
+            REPLACE_ECR_API_REPO=$REGISTRY/sales-pipeline-api:${{ github.sha }} \
+            REPLACE_ECR_WORKER_REPO=$REGISTRY/sales-pipeline-worker:${{ github.sha }}
+
+      - name: Validate manifests with the pin applied (same gate as k8s-validate)
+        run: |
+          curl -sfLo kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz && sudo mv kubeconform /usr/local/bin/
+          bash scripts/validate-manifests.sh k8s/overlays/prod
+
+      - name: Commit the pinned tags back to Git
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/overlays/prod/kustomization.yaml
+          if git commit -m "deploy: pin images to ${{ github.sha }}"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no tag change to commit"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          git pull --rebase origin main
+          git push
+
+      - name: Force immediate ArgoCD refresh (in-VPC CodeBuild, skips the poll timer)
+        id: refresh
+        if: steps.commit.outputs.changed == 'true'
+        continue-on-error: true
+        uses: aws-actions/aws-codebuild-run-build@v1
+        with:
+          project-name: ${{ env.ARGOCD_REFRESH_PROJECT }}
+          disable-source-override: true
+
+      - name: Warn if instant refresh failed (deploy still lands via poll timer)
+        if: steps.commit.outputs.changed == 'true' && steps.refresh.outcome != 'success'
+        run: echo "::warning::ArgoCD instant refresh failed - the deploy is NOT lost (poll timer ~3min will sync). If persistent, check the refresher CodeBuild project and its RBAC binding."

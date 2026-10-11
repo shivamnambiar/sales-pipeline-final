@@ -1,0 +1,38 @@
+version: 0.2
+
+env:
+  variables:
+    TF_VERSION: "1.16.1"
+    TF_COMMAND: "plan"
+    TF_IN_AUTOMATION: "true"
+
+phases:
+  install:
+    commands:
+      - curl -sSLo /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+      - unzip -o /tmp/tf.zip -d /usr/local/bin
+      - terraform version
+  build:
+    commands:
+      - cd terraform/platform-stack
+      - |
+        terraform init -input=false \
+          -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+          -backend-config="key=platform.tfstate" \
+          -backend-config="region=${AWS_REGION}" \
+          -backend-config="encrypt=true" \
+          -backend-config="use_lockfile=true"
+      - |
+        case "${TF_COMMAND}" in
+          plan)
+            terraform plan -input=false -out=tfplan
+            terraform show -no-color tfplan
+            ;;
+          apply)
+            terraform apply -input=false -auto-approve
+            ;;
+          *)
+            echo "unsupported TF_COMMAND: '${TF_COMMAND}' (expected plan or apply)" >&2
+            exit 1
+            ;;
+        esac

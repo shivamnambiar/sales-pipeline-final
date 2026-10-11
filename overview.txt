@@ -1,0 +1,397 @@
+OVERVIEW - sales-pipeline-final
+One entry per file: what it is, and why it matters. Grouped by directory.
+
+=====================================================================
+.claude/ - Claude Code session configuration
+=====================================================================
+
+.claude/output-styles/grounded.md
+  The custom output style named "grounded" (selected by settings.json, keeps the coding instructions). Four rules:
+  explain reasoning before proposing infra or architecture changes, say so plainly when a change contradicts a
+  settled project decision, plain language matched to the size of the question, and check any claim against the
+  repo before asserting it. Matters because it shapes how every AI session here behaves.
+
+.claude/settings.json
+  Claude Code permissions, defaultMode auto. Allow list is the read-only loop: terraform fmt/validate/version and
+  init -backend=false (bare or -chdir for either stack), kustomize build, kubeconform, the manifest gate, the three
+  test files by name, jq, shellcheck, and git status/diff/log/show. Deny list: terraform apply/destroy/import/
+  state/taint/untaint/force-unlock/workspace/login and init -migrate-state, terragrunt, aws, aws-vault, eksctl,
+  sam, cdk, kubectl, helm, kustomize plugin/helm/exec flags, curl, wget, ssh, scp, git push, PowerShell, cmd,
+  bash -c, sh -c, env, eval; Edit on .claude/, CLAUDE.md, DESIGN.md, the gate script, the three test files, the
+  two audit logs, tfvars, MCP and user-level config; Read on tfstate, tfplan, plan.txt, crash.log and ~/.aws.
+  Matters because AWS credentials exist on this machine and this file is what stops an AI session spending
+  money or changing real state. CI's guardrails job parses it on every PR.
+
+=====================================================================
+.github/ - CI/CD
+=====================================================================
+
+.github/workflows/app.yml
+  App pipeline. PRs: run the three test files. Push to main: build api + worker images, Trivy scan (fail on
+  CRITICAL/HIGH), push to ECR tagged with the git SHA, pin that tag into k8s/overlays/prod, commit it back, then
+  poke ArgoCD via an in-VPC CodeBuild job. Matters because it is the only path from code to cluster; it never
+  touches EKS directly, Git stays the source of truth.
+
+.github/workflows/k8s-validate.yml
+  Every PR and push: runs scripts/validate-manifests.sh (the manifest gate), shellchecks scripts/*.sh and smoke.sh,
+  and parses .claude/settings.json. Needs no AWS. Matters because it is the cheap gate that catches a broken
+  overlay before ArgoCD ever sees it.
+
+.github/workflows/terraform.yml
+  Infra pipeline. PRs: fmt, validate, plan, plan summary commented on the PR. Merge to main: apply the root stack,
+  then package terraform/platform-stack and run its plan and apply inside a CodeBuild project in the VPC (the EKS
+  endpoint is private, so GitHub runners cannot reach it). Matters because this is the workflow that will do the
+  first real apply, the project's next milestone.
+
+.github/CICD_SETUP.md
+  What a human must set up in GitHub before CI can run: secrets, variables, the production environment, the two
+  OIDC IAM roles, and why the platform stack runs in CodeBuild. Matters because CI has hard dependencies on these
+  and nothing else documents them.
+
+=====================================================================
+api/ - FastAPI ingest + status service
+=====================================================================
+
+api/api_requirements.txt
+  Pinned Python dependencies for the API image. Pinned so builds are reproducible and Trivy results are stable.
+
+api/Dockerfile.api
+  Builds the API image: python 3.12-slim, non-root user, uvicorn on 8000. Small surface for the image scan.
+
+api/main.py
+  The API. POST /jobs validates a batch (max 50,000 records, the load-tested limit), stores the raw batch in S3,
+  puts a tiny pointer message on SQS, records a job row, returns 202 with a job_id. GET /jobs/{id} and
+  /jobs/{id}/result read status and results. /healthz, /readyz (checks DB, SQS, S3), /metrics. Enforces a
+  Content-Length body cap and supports IAM auth to RDS. Matters because it defines the contracts the worker, the
+  manifests (ports, probes, env names) and the tests all depend on.
+
+api/smoke_test.py
+  Self-contained API test using moto (fake AWS) and sqlite; the exact test CI runs. Checks the S3/SQS pointer
+  contract, 4xx handling, size caps. Read-only to Claude by rule. Matters because it is CI's definition of "the
+  API works".
+
+=====================================================================
+docs/ - design record and CI IAM templates
+=====================================================================
+
+docs/DESIGN.md
+  The whys: why the app is tiny, why everything is private, how deploys and scaling work, what is deliberately
+  deferred. Matters because it is the record that stops settled decisions (NAT, digests, limits) being reopened.
+
+docs/app-ci-role-trust.json
+  Trust policy template for the IAM role app.yml assumes via GitHub OIDC, scoped to this repo and that workflow
+  file. Matters because a wrong trust policy means CI cannot push images at all.
+
+docs/terraform-ci-role-trust.json
+  Same shape for the role terraform.yml assumes. Scoped to terraform.yml only, so the app workflow cannot run
+  Terraform.
+
+docs/terraform-ci-role-policy.json
+  Permissions policy for the Terraform CI role: service-wide on the services the stack creates, resource-scoped
+  for state and CodeBuild, enumerated IAM actions, and a deny on buildspec override. Matters because it bounds
+  what an auto-apply on main can do.
+
+docs/terraform-ci-role-README.md
+  How to use the two Terraform role JSON files, what to replace, and the scoping rationale and caveats.
+
+=====================================================================
+k8s/ - Kustomize manifests synced by ArgoCD
+=====================================================================
+
+k8s/argocd/application.yaml
+  The ArgoCD Application: watches k8s/overlays/prod on main, auto-sync with prune and self-heal, ignores
+  spec.replicas on both Deployments (HPA and KEDA own those). Matters because it is the GitOps hook itself.
+
+k8s/base/kustomization.yaml
+  Composes the two halves, app/ and platform/.
+
+k8s/base/app/kustomization.yaml
+  Lists the app resources and forces them into the sales-pipeline namespace.
+
+k8s/base/app/00-namespace.yaml
+  The sales-pipeline namespace with the "restricted" Pod Security Standard enforced. Every pod must be hardened.
+
+k8s/base/app/01-serviceaccounts.yaml
+  The api and worker ServiceAccounts with IRSA role annotations (placeholders until bootstrap). This is how pods
+  get AWS permissions without keys.
+
+k8s/base/app/03-api-deployment.yaml
+  api Deployment (3 replicas, on-demand nodes, zone spread, read-only root FS, no capabilities), its ClusterIP
+  Service, and an HPA scaling 3 to 10 on CPU. Matters because the availability story (PDB + rolling + HPA) rests
+  on it.
+
+k8s/base/app/04-worker-deployment.yaml
+  worker Deployment on spot nodes (toleration + nodeSelector), same hardening, metrics on 9100, 60s grace period
+  so an in-flight batch finishes. KEDA scales it.
+
+k8s/base/app/05-worker-scaledobject.yaml
+  KEDA TriggerAuthentication (pod identity) and ScaledObject: worker scales 0 to 20 on SQS queue length. Matters
+  because it is the cost lever: zero workers when the queue is empty.
+
+k8s/base/app/07-instrumentation.yaml
+  OpenTelemetry auto-instrumentation for the Python pods, traces only, sent to the collector.
+
+k8s/base/app/10-pdb.yaml
+  PodDisruptionBudgets: api keeps 2 available, worker allows 1 unavailable. Protects the API during node churn
+  (Karpenter consolidation, spot interruptions).
+
+k8s/base/app/11-networkpolicy.yaml
+  Default deny ingress and egress, then allow: monitoring scrapes, DNS, and app egress on 443/5432/4318 with
+  the instance metadata endpoint excluded. Matters because it is the in-cluster half of the private design.
+
+k8s/base/platform/kustomization.yaml
+  Lists the platform-side resources (things that live in monitoring/opentelemetry namespaces).
+
+k8s/base/platform/08-podmonitor.yaml
+  PodMonitors so Prometheus scrapes api (/metrics on http) and worker (9100) across namespaces.
+
+k8s/base/platform/09-karpenter-nodepools.yaml
+  Karpenter EC2NodeClass (AL2023, IMDSv2 required) plus an on-demand pool and a spot pool with CPU limits and
+  consolidation. Matters because it decides what compute the app pods land on and what it costs.
+
+k8s/base/platform/12-otel-collector.yaml
+  The OpenTelemetry Collector: receives OTLP, batches, exports traces to Tempo.
+
+k8s/base/platform/13-prometheus-rules.yaml
+  Alert rules: worker job failures, high rejection rate, slow processing, API 5xx rate, API unavailable/down/
+  scrape missing. Matters because these are the signals that reach Alertmanager and SNS.
+
+k8s/overlays/prod/kustomization.yaml
+  The one place values live: image tags (pinned by CI), the app-config ConfigMap (region, queue, bucket, DB host),
+  IRSA ARN patches, and replacements that push those values into the KEDA and Karpenter CRDs. Holds REPLACE_
+  tokens until bootstrap-overlay.sh fills them. Carries a protected explanatory note. Matters because it is the
+  single source of truth for every environment-specific value.
+
+k8s/README.md
+  How the base/overlay layout works, the REPLACE_ substitution contract, the availability and network-policy
+  reasoning, how to reach the private API and Grafana.
+
+=====================================================================
+loadtest/ - calibration load generator
+=====================================================================
+
+loadtest/loadgen.py
+  Stdlib-only load generator: multi-process async HTTP, staged ramps, stop rules on accept ratio and CPU, CSV
+  output. Matters because the batch limits are supposed to be measured, and this is the instrument.
+
+loadtest/config-calibration.json
+  The in-cluster run: ping ramps to 4,000 req/s and /jobs ramps to 100 jobs/s with gaps and a long drain.
+
+loadtest/config-local.json
+  A short version of the same shape against the docker compose stack, for checking the generator itself.
+
+loadtest/loadgen-deployment.yaml
+  Runs the generator as a hardened pod on the monitoring node, script and config mounted from a ConfigMap.
+
+loadtest/kustomization.yaml
+  Packages loadgen.py and the calibration config into that ConfigMap in the monitoring namespace.
+
+=====================================================================
+localstack-init/ - local AWS stand-in
+=====================================================================
+
+localstack-init/init.sh
+  Creates the S3 bucket, the DLQ and the jobs queue (redrive after 3 receives) inside LocalStack for compose.
+
+=====================================================================
+scripts/ - operator scripts
+=====================================================================
+
+scripts/bootstrap-overlay.sh
+  Phase 2, run once after both stacks apply: preflights tools, branch, remote, cluster and CRDs, then substitutes
+  Terraform outputs into the overlay and the ArgoCD Application, runs the gate, commits, pushes, applies the
+  Application. Matters because it turns the REPLACE_ placeholders into a deployable overlay.
+
+scripts/db-bootstrap.sh
+  Phase 1.5 runner: reads the RDS endpoint and managed master secret, runs db-bootstrap.sql from a psql pod on
+  the bootstrap node group, then verifies the grants. --verify-only re-checks.
+
+scripts/db-bootstrap.sql
+  Creates the app_api and app_worker IAM-auth database users with scoped grants and default privileges. Keeps the
+  master user as password break-glass. Operator comments are intentional here. Matters because without it the
+  pods cannot log in to RDS.
+
+scripts/validate-manifests.sh
+  CI's manifest gate: kustomize build the overlay, refuse mutable tags, digests, untagged images and leftover
+  REPLACE_ tokens, then kubeconform against the pinned Kubernetes version and CRD schemas. Read-only to Claude by
+  rule. Matters because it encodes the tag-immutability decision.
+
+=====================================================================
+terraform/ - root infra stack
+=====================================================================
+
+terraform/versions.tf
+  Terraform and AWS provider constraints, provider region from var.region, default tags.
+
+terraform/backend.tf
+  Deliberately empty S3 backend block; bucket, key and region are injected at init time by CI.
+
+terraform/main.tf
+  Wires the six modules together: kms, network, security, data, cicd, cluster. The dependency graph of the infra.
+
+terraform/variables.tf
+  Root inputs. region and tf_state_bucket have no default on purpose, so a local run without CI values fails
+  loudly. Architectural defaults (name, CIDR, AZs, NAT) live here; there is no tfvars file by design.
+
+terraform/outputs.tf
+  Everything downstream reads: subnet IDs, RDS endpoint, queue URL, bucket, ECR URLs, cluster name, IRSA ARNs,
+  Karpenter role and queue. bootstrap-overlay.sh and the platform stack consume these.
+
+terraform/.terraform.lock.hcl
+  Provider version and hash lock for the root stack (aws, cloudinit, null, time, tls). Committed so CI and local
+  runs resolve identical providers.
+
+terraform/README.md
+  One-time state bucket creation, the init/plan/apply workflow, module order, NAT strategy, teardown, and why
+  there are two stacks.
+
+--- modules/kms
+terraform/modules/kms/main_kms.tf
+  One customer-managed KMS key with a key policy granting use to RDS, SQS, S3, Secrets Manager, ECR, SNS,
+  CloudWatch Logs, EventBridge and EKS. Every encrypted thing in the project uses this key.
+terraform/modules/kms/variables_kms.tf   Name, tags, region (for region-scoped service principals).
+terraform/modules/kms/outputs_kms.tf     Key ARN and ID.
+
+--- modules/network
+terraform/modules/network/main_network.tf
+  VPC, public/private/isolated subnets per AZ, internet gateway, NAT (single, permanent), route tables.
+  Private subnets carry the karpenter.sh/discovery tag.
+terraform/modules/network/endpoints_network.tf
+  S3 gateway endpoint plus ECR api and dkr interface endpoints, so image pulls and S3 stay off the NAT.
+terraform/modules/network/flowlogs_network.tf
+  VPC flow logs to an encrypted CloudWatch log group with its own role.
+terraform/modules/network/variables_network.tf   CIDR, AZ count, NAT flags, retention.
+terraform/modules/network/outputs_network.tf     Subnet IDs and CIDRs the other modules consume.
+
+--- modules/security
+terraform/modules/security/main_security.tf
+  IRSA roles and least-privilege policies for api, worker, KEDA, Alertmanager and Fluent Bit (S3 raw bucket,
+  SQS, rds-db:connect, SNS publish, log writes). Matters because this is how pods get exactly the AWS access
+  they need and nothing more.
+terraform/modules/security/variables_security.tf   OIDC provider, resource ARNs, DB user names.
+terraform/modules/security/outputs_security.tf     The five role ARNs.
+
+--- modules/data
+terraform/modules/data/main_data.tf
+  The stateful layer: two ECR repos (IMMUTABLE tags, scan on push, KMS), the raw S3 bucket (KMS, TLS-only,
+  30-day expiry), SQS jobs queue plus DLQ, RDS Postgres in isolated subnets with an RDS-managed master secret,
+  log groups, SNS topic with EventBridge rules for image-scan findings, and a DLQ-not-empty alarm.
+terraform/modules/data/variables_data.tf   Instance class, Postgres major, visibility timeout, retention days.
+terraform/modules/data/outputs_data.tf     Endpoints, ARNs, URLs and the secret ARN.
+
+--- modules/cicd
+terraform/modules/cicd/main_cicd.tf
+  The in-VPC CodeBuild project that plans and applies the platform stack (role, security group, log group), and
+  a second minimal CodeBuild project app.yml uses to force an immediate ArgoCD refresh. Matters because it is
+  the only way anything reaches the private EKS endpoint from CI.
+terraform/modules/cicd/variables_cicd.tf   State bucket, subnets, cluster name, KMS.
+terraform/modules/cicd/outputs_cicd.tf     Project names, role ARNs, security group ID.
+
+--- modules/cluster
+terraform/modules/cluster/main_cluster.tf
+  EKS via terraform-aws-modules: private endpoint by default, IRSA, control-plane logs, pinned addons (vpc-cni
+  with network policy on, coredns, kube-proxy), a tainted bootstrap node group and a monitoring node group,
+  the Karpenter submodule, and access entries for the operator, CodeBuild and the refresh role.
+terraform/modules/cluster/variables_cluster.tf   Cluster version, addon versions, node group sizes, endpoint flags.
+terraform/modules/cluster/outputs_cluster.tf     Cluster name/endpoint, OIDC provider, Karpenter role and queue.
+
+--- modules/platform (loaded only by platform-stack)
+terraform/modules/platform/main_platform.tf
+  Helm releases for Karpenter, metrics-server, KEDA, OpenTelemetry operator, kube-prometheus-stack, Tempo,
+  Fluent Bit and ArgoCD, all pinned to the bootstrap/monitoring node groups, plus the namespace-scoped RBAC for
+  the ArgoCD refresher. This is the platform layer the app manifests assume exists.
+terraform/modules/platform/variables_platform.tf   Chart versions, Grafana password, IRSA ARNs threaded in.
+terraform/modules/platform/outputs_platform.tf     Namespaces and the Grafana service DNS.
+terraform/modules/platform/versions_platform.tf    helm and kubernetes provider constraints.
+
+--- platform-stack (second stack, applied from CodeBuild)
+terraform/platform-stack/versions_platform_stack.tf
+  Providers, remote-state read of the infra stack, and helm/kubernetes auth through aws eks get-token. Matters
+  because it is the fix for the provider deadlock: the cluster must exist before this stack can even plan.
+terraform/platform-stack/backend_platform_stack.tf   Empty S3 backend, key platform.tfstate injected at init.
+terraform/platform-stack/main_platform_stack.tf      Calls modules/platform with values from the infra state.
+terraform/platform-stack/variables_platform_stack.tf
+  region (no default), cluster name, Grafana password (validated non-empty), state bucket.
+terraform/platform-stack/outputs_platform_stack.tf   Monitoring namespace and Grafana service.
+terraform/platform-stack/buildspec.yml
+  What CodeBuild runs: install the pinned Terraform, init with the platform state key, then plan or apply per
+  TF_COMMAND. The CI role denies any buildspec override, so this file is the only one that can run.
+terraform/platform-stack/.terraform.lock.hcl   Provider lock for this stack (aws, helm, kubernetes).
+
+=====================================================================
+worker/ - SQS consumer
+=====================================================================
+
+worker/worker_requirements.txt   Pinned deps: sqlalchemy, psycopg2, boto3, prometheus-client.
+worker/Dockerfile.worker         Worker image, non-root, metrics on 9100.
+
+worker/processing.py
+  Pure logic, no I/O: validate each record, reject duplicates by order_id, aggregate totals per region, count
+  rejections by reason. Matters because it is the testable core and the source of the rejection metrics.
+
+worker/worker.py
+  The consumer: long-polls SQS, checks the pointer message and the S3 key shape, refuses objects over 15MB (the
+  load-tested cap), runs process_batch, writes results idempotently (insert-if-absent) so redeliveries never
+  double-count, leaves malformed messages for the DLQ, exports Prometheus metrics, stops cleanly on SIGTERM.
+
+worker/test_processing.py
+  Unit tests for processing.py including adversarial and hostile inputs; the function must never raise.
+  Read-only to Claude by rule.
+
+worker/integration_test.py
+  End-to-end handle_message test with moto and sqlite: first run, redelivery (idempotent), oversized object
+  marked failed, malformed message to DLQ, forged S3 key never fetched. Read-only to Claude by rule.
+
+=====================================================================
+Root files
+=====================================================================
+
+CLAUDE.md
+  Project instructions for Claude Code: the repo map, the rules (no comments, allow-listed shell, immutable tags,
+  permanent NAT, no tfvars, read-only files), and the commands. Matters because it is the contract every AI
+  session in this repo works under.
+
+RUNBOOK.md
+  Operations reference from nothing to steady state: local setup, where every config value lives, Phase 0 manual
+  bootstrap, reaching the private cluster, Phase 1 infra/platform, Phase 1.5 DB users, Phase 2 overlay bootstrap,
+  Phase 3 first image, cost, and the first-apply watch list.
+
+docker-compose.yml
+  Local end-to-end stack: Postgres, LocalStack (S3 + SQS), api, worker, and an optional loadgen profile.
+
+smoke.sh
+  Curl-based e2e check against the compose stack: submit a mixed batch, poll to done, print the result and the
+  expected totals. The correctness oracle the load test plan also leans on.
+
+.gitignore
+  Keeps Terraform state and plans (they can hold secrets), Python caches, test DBs, zips and personal Claude
+  overrides out of Git. Explicitly keeps the lock files in.
+
+audit-fixes.txt
+  Log of the Claude Code configuration audit (2026-09-07): hook and permission fixes, what was tested, what was
+  skipped. Explains why settings.json and the hooks look the way they do.
+
+tf-audit.txt
+  Static audit of the Terraform stacks (2026-09-07): what validate covered, findings, hygiene, and what could
+  not be checked without an account.
+
+k8s-audit.txt
+  Audit of the Kubernetes layer and its contracts with Terraform and the app (2026-09-07/08).
+
+k8s-fixes.txt
+  Commit-by-commit fix log for k8s-audit.txt, including what could not be verified and overclaims walked back.
+
+bootstrap-audit.txt
+  Audit of bootstrap-overlay.sh as an operational procedure (2026-09-08/09): every assumption it makes before,
+  during and after it runs.
+
+bootstrap-fixes.txt
+  Fix log for that audit: the script grew from 99 to 206 lines of preflights, plus the doc corrections.
+
+loadtest-plan.txt
+  The calibration load test plan (2026-09-09, corrected later): numbers from the repo, ramp shape, which ceiling
+  should trip first, the observer, alerts expected, cost and abort path. The reason loadtest/ exists.
+
+preflight.txt
+  Pre-apply preflight (2026-09-21) across the seams the single-layer audits did not cover. Its short answer lists
+  the things that would stop the first run today, so it is the checklist to clear before terraform apply.

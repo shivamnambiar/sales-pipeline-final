@@ -1,0 +1,318 @@
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
+concurrency:
+  group: tf-state-lock
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.16.1"
+  WORKING_DIR: terraform
+  PLATFORM_DIR: terraform/platform-stack
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+  TF_VAR_operator_principal_arn: ${{ secrets.TF_VAR_OPERATOR_PRINCIPAL_ARN }}
+  PLATFORM_BUILD_PROJECT: sales-pipeline-platform
+
+jobs:
+  plan:
+    name: validate & plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+    env:
+      TF_VAR_scan_alert_email: ${{ secrets.SCAN_ALERT_EMAIL }}
+      TF_VAR_tf_state_bucket: ${{ secrets.TF_BACKEND_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+        continue-on-error: false
+
+      - name: Extract plan summary
+        id: summary
+        run: |
+          SUMMARY=$(grep -E "^(Plan:|No changes\.)" plan.txt | head -1 || true)
+          [ -n "$SUMMARY" ] || SUMMARY="Plan generated — see artifact."
+          echo "line=${SUMMARY}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.WORKING_DIR }}-${{ github.sha }}
+          path: |
+            ${{ env.WORKING_DIR }}/tfplan
+            ${{ env.WORKING_DIR }}/plan.txt
+          retention-days: 7
+
+      - name: Comment plan summary on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `### Terraform Plan 📋 — \`${{ env.WORKING_DIR }}\`
+            **${{ steps.summary.outputs.line }}**
+
+            Full plan (binary \`tfplan\` + readable \`plan.txt\`) is attached as artifact \`tfplan-${{ env.WORKING_DIR }}-${{ github.sha }}\` on this run — download to review the full diff before merging. Merge to main auto-applies.`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  apply:
+    name: apply
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+    env:
+      TF_VAR_scan_alert_email: ${{ secrets.SCAN_ALERT_EMAIL }}
+      TF_VAR_tf_state_bucket: ${{ secrets.TF_BACKEND_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: terraform plan
+        run: terraform plan -no-color -out=tfplan
+
+      - name: terraform apply
+        run: terraform apply -auto-approve tfplan
+
+  platform-plan:
+    name: platform validate & plan (CodeBuild)
+    needs: apply
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      TF_COMMAND: plan
+      TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+      TF_VAR_tf_state_bucket: ${{ secrets.TF_BACKEND_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Package platform source
+        run: |
+          zip -qr platform-src.zip terraform/platform-stack terraform/modules/platform
+          aws s3 cp platform-src.zip "s3://${{ secrets.TF_BACKEND_BUCKET }}/codebuild/platform-src.zip"
+
+      - name: Run platform plan in CodeBuild (in-VPC, logs stream live)
+        id: build
+        uses: aws-actions/aws-codebuild-run-build@v1
+        with:
+          project-name: ${{ env.PLATFORM_BUILD_PROJECT }}
+          disable-source-override: true
+          env-vars-for-codebuild: |
+            TF_COMMAND,
+            TF_BACKEND_BUCKET,
+            TF_VAR_tf_state_bucket,
+            TF_VAR_region
+
+      - name: Persist plan output for artifact
+        if: always() && steps.build.outputs.aws-build-id != ''
+        run: |
+          STREAM="${BUILD_ID#*:}"
+          aws logs filter-log-events \
+            --log-group-name "/aws/codebuild/${{ env.PLATFORM_BUILD_PROJECT }}" \
+            --log-stream-names "$STREAM" \
+            --output json | jq -r '.events[].message | rtrimstr("\n")' > plan.txt || true
+        env:
+          BUILD_ID: ${{ steps.build.outputs.aws-build-id }}
+
+      - name: Upload platform plan output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-platform-${{ github.sha }}
+          path: plan.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+  platform-plan-pr:
+    name: platform validate & plan (PR, CodeBuild)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      TF_COMMAND: plan
+      TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+      TF_VAR_tf_state_bucket: ${{ secrets.TF_BACKEND_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Package platform source
+        id: package
+        continue-on-error: true
+        run: |
+          zip -qr platform-src.zip terraform/platform-stack terraform/modules/platform
+          aws s3 cp platform-src.zip "s3://${{ secrets.TF_BACKEND_BUCKET }}/codebuild/platform-src.zip"
+
+      - name: Run platform plan in CodeBuild (in-VPC, logs stream live)
+        id: build
+        continue-on-error: true
+        uses: aws-actions/aws-codebuild-run-build@v1
+        with:
+          project-name: ${{ env.PLATFORM_BUILD_PROJECT }}
+          disable-source-override: true
+          env-vars-for-codebuild: |
+            TF_COMMAND,
+            TF_BACKEND_BUCKET,
+            TF_VAR_tf_state_bucket,
+            TF_VAR_region
+
+      - name: Persist plan output + summary
+        id: summary
+        if: steps.build.outcome == 'success'
+        run: |
+          STREAM="${BUILD_ID#*:}"
+          aws logs filter-log-events \
+            --log-group-name "/aws/codebuild/${{ env.PLATFORM_BUILD_PROJECT }}" \
+            --log-stream-names "$STREAM" \
+            --output json | jq -r '.events[].message | rtrimstr("\n")' > plan.txt || true
+          SUMMARY=$(grep -E "^(Plan:|No changes\.)" plan.txt | head -1 || true)
+          [ -n "$SUMMARY" ] || SUMMARY="Plan ran in CodeBuild - see artifact."
+          echo "line=${SUMMARY}" >> "$GITHUB_OUTPUT"
+        env:
+          BUILD_ID: ${{ steps.build.outputs.aws-build-id }}
+
+      - name: Upload platform plan output
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-platform-pr-${{ github.sha }}
+          path: plan.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Comment platform plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const planned = "${{ steps.build.outcome }}" === "success";
+            const summary = "${{ steps.summary.outputs.line }}";
+            const body = planned
+              ? `### Terraform Plan 📋 — \`platform-stack\` (ran in-VPC via CodeBuild)
+            **${summary}**
+
+            Full plan output attached as artifact \`tfplan-platform-pr-${{ github.sha }}\` on this run; the live log is also inline in the job above.`
+              : `### Terraform Plan ⚠️ — \`platform-stack\`
+            The platform plan could not run. This is expected before the first infra apply: the CodeBuild project and the EKS cluster are created by the infra stack, and the platform stack's providers read the live cluster. Once infra is applied, platform PR plans run in-VPC via CodeBuild. This job is non-blocking by design.`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  platform-apply:
+    name: platform apply (CodeBuild)
+    needs: platform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      TF_COMMAND: apply
+      TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+      TF_VAR_tf_state_bucket: ${{ secrets.TF_BACKEND_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Package platform source
+        run: |
+          zip -qr platform-src.zip terraform/platform-stack terraform/modules/platform
+          aws s3 cp platform-src.zip "s3://${{ secrets.TF_BACKEND_BUCKET }}/codebuild/platform-src.zip"
+
+      - name: Run platform apply in CodeBuild (in-VPC, logs stream live)
+        uses: aws-actions/aws-codebuild-run-build@v1
+        with:
+          project-name: ${{ env.PLATFORM_BUILD_PROJECT }}
+          disable-source-override: true
+          env-vars-for-codebuild: |
+            TF_COMMAND,
+            TF_BACKEND_BUCKET,
+            TF_VAR_tf_state_bucket,
+            TF_VAR_region

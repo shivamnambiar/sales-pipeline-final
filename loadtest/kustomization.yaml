@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: monitoring
+
+resources:
+  - loadgen-deployment.yaml
+
+configMapGenerator:
+  - name: loadgen-script
+    files:
+      - loadgen.py
+      - config.json=config-calibration.json
+    options:
+      disableNameSuffixHash: true

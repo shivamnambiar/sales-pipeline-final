@@ -1,0 +1,31 @@
+{
+  "target": "http://api:8000",
+  "workers": 2,
+  "tick_ms": 5,
+  "max_inflight": 256,
+  "connect_timeout_s": 5.0,
+  "read_timeout_s": 30.0,
+  "bodies_per_variant": 8,
+  "ndjson_path": "/data/gen-requests.ndjson",
+  "ndjson_sample": 1,
+  "resolve_once": true,
+  "start_grace_s": 2.0,
+  "deadline_s": 600,
+  "on_complete": "exit",
+  "cpu_limit_m": 2000,
+  "stages": [
+    {"name": "base", "kind": "idle", "duration_s": 20},
+    {"name": "A-25", "kind": "get", "path": "/__loadgen_ping", "rate": 25, "duration_s": 20},
+    {"name": "A-50", "kind": "get", "path": "/__loadgen_ping", "rate": 50, "duration_s": 20},
+    {"name": "A-100", "kind": "get", "path": "/__loadgen_ping", "rate": 100, "duration_s": 20},
+    {"name": "A-200", "kind": "get", "path": "/__loadgen_ping", "rate": 200, "duration_s": 20,
+     "stop_rule": {"accept_ratio_min": 0.95, "cpu_frac_max": 0.85, "window_s": 15, "on_trip": "record"}},
+    {"name": "A-settle", "kind": "idle", "duration_s": 15},
+    {"name": "P-2", "kind": "jobs", "path": "/jobs", "rate": 2, "duration_s": 30,
+     "mix": [{"n": 1000, "weight": 1.0, "reject_frac": 0.02}]},
+    {"name": "P-5", "kind": "jobs", "path": "/jobs", "rate": 5, "duration_s": 30,
+     "mix": [{"n": 1000, "weight": 1.0, "reject_frac": 0.02}],
+     "stop_rule": {"accept_ratio_min": 0.95, "cpu_frac_max": 0.85, "window_s": 15, "on_trip": "record"}},
+    {"name": "drain", "kind": "idle", "duration_s": 60}
+  ]
+}

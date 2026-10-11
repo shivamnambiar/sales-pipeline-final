@@ -1,0 +1,74 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sales-pipeline-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: sales-pipeline.worker
+      rules:
+        - alert: WorkerJobFailures
+          expr: increase(worker_jobs_processed_total{outcome="failed"}[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Worker is failing jobs
+            description: The worker recorded {{ $value }} failed jobs in the last 10 minutes.
+        - alert: HighRecordRejectionRate
+          expr: |
+            sum(rate(worker_records_rejected_total[10m]))
+              /
+            clamp_min(sum(rate(worker_records_total[10m])), 1) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: High sales-record rejection rate
+            description: More than 20% of records are being rejected over the last 10 minutes.
+        - alert: WorkerProcessingSlow
+          expr: histogram_quantile(0.95, sum(rate(worker_processing_seconds_bucket[10m])) by (le)) > 10
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Worker batch processing is slow
+            description: p95 batch processing time has exceeded 10s for 10 minutes.
+    - name: sales-pipeline.api
+      rules:
+        - alert: APIHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{handler!~"/healthz|/readyz|/metrics",status=~"5.."}[5m]))
+              /
+            clamp_min(sum(rate(http_requests_total{handler!~"/healthz|/readyz|/metrics"}[5m])), 1) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: API 5xx error rate elevated
+            description: More than 5% of client API requests are returning 5xx over the last 5 minutes. Probe and metrics handlers are excluded.
+        - alert: APIUnavailable
+          expr: kube_deployment_status_replicas_available{namespace="sales-pipeline",deployment="api"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: No API replica is available
+            description: Every api pod has been failing readiness for 5 minutes - /readyz checks the database, SQS and S3, so treat this as a dependency outage until proven otherwise.
+        - alert: APIDown
+          expr: up{job="monitoring/api"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: API target is down
+            description: Prometheus cannot scrape the sales-pipeline API pod {{ $labels.instance }}.
+        - alert: APIScrapeMissing
+          expr: absent(up{job="monitoring/api"})
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: API scrape target has disappeared
+            description: Prometheus holds no monitoring/api series at all - the api Deployment, its pods, or the PodMonitor that selects them is gone.

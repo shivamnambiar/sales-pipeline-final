@@ -1,0 +1,46 @@
+name: k8s-validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: k8s-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: kustomize build + kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kustomize + kubeconform
+        run: |
+          curl -sfLo kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz
+          tar -xzf kustomize.tar.gz && sudo mv kustomize /usr/local/bin/
+          curl -sfLo kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz && sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate manifests (shared gate - scripts/validate-manifests.sh)
+        run: bash scripts/validate-manifests.sh k8s/overlays/prod
+
+  guardrails:
+    name: shellcheck scripts + settings JSON
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the shell scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning scripts/*.sh smoke.sh
+
+      - name: Settings and workflow JSON/YAML parse
+        run: |
+          jq empty .claude/settings.json
+          python3 -c "import json;json.load(open('.claude/settings.json'))"

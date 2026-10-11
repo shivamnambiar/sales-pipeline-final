@@ -1,0 +1,95 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: REPLACE_ECR_API_REPO
+    newTag: REPLACE_SHA
+  - name: REPLACE_ECR_WORKER_REPO
+    newTag: REPLACE_SHA
+
+configMapGenerator:
+  - name: app-config
+    namespace: sales-pipeline
+    literals:
+      - AWS_DEFAULT_REGION=REPLACE_AWS_REGION
+      - SQS_QUEUE_URL=REPLACE_SQS_QUEUE_URL
+      - S3_BUCKET=REPLACE_RAW_BUCKET
+      - DB_IAM_AUTH=true
+      - DB_HOST=REPLACE_DB_HOST
+      - DB_PORT=5432
+      - DB_NAME=REPLACE_DB_NAME
+  - name: infra-values
+    literals:
+      - CLUSTER_NAME=REPLACE_CLUSTER_NAME
+      - KARPENTER_NODE_ROLE=REPLACE_KARPENTER_NODE_ROLE
+    options:
+      disableNameSuffixHash: true
+      annotations:
+        config.kubernetes.io/local-config: "true"
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: api
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/eks.amazonaws.com~1role-arn
+        value: REPLACE_API_IRSA_ROLE_ARN
+  - target:
+      kind: ServiceAccount
+      name: worker
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/eks.amazonaws.com~1role-arn
+        value: REPLACE_WORKER_IRSA_ROLE_ARN
+
+# CRD spec fields (KEDA ScaledObject, OTel) aren't reached by
+# images/configMapGenerator, so inject those from the app-config ConfigMap into
+# the specific CRD paths. This keeps the overlay the single source of values.
+replacements:
+  - source:
+      kind: ConfigMap
+      name: app-config
+      fieldPath: data.SQS_QUEUE_URL
+    targets:
+      - select:
+          kind: ScaledObject
+          name: worker
+        fieldPaths:
+          - spec.triggers.0.metadata.queueURL
+  - source:
+      kind: ConfigMap
+      name: app-config
+      fieldPath: data.AWS_DEFAULT_REGION
+    targets:
+      - select:
+          kind: ScaledObject
+          name: worker
+        fieldPaths:
+          - spec.triggers.0.metadata.awsRegion
+  - source:
+      kind: ConfigMap
+      name: infra-values
+      fieldPath: data.KARPENTER_NODE_ROLE
+    targets:
+      - select:
+          kind: EC2NodeClass
+          name: default
+        fieldPaths:
+          - spec.role
+  - source:
+      kind: ConfigMap
+      name: infra-values
+      fieldPath: data.CLUSTER_NAME
+    targets:
+      - select:
+          kind: EC2NodeClass
+          name: default
+        fieldPaths:
+          - spec.securityGroupSelectorTerms.0.tags.[karpenter.sh/discovery]
+          - spec.subnetSelectorTerms.0.tags.[karpenter.sh/discovery]
+        options:
+          create: true

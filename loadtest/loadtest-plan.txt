@@ -1,0 +1,1558 @@
+LOAD TEST PLAN - sales-pipeline
+Date: 2026-09-09. Plan only. No code written, no existing file changed. The only
+file this session created is this one.
+
+SCOPE
+In:  a calibration load test of the deployed system - the /jobs ingest path, the
+     api HPA, the KEDA-scaled worker, both Karpenter NodePools, RDS, SQS, and the
+     alerting path. Injection from an in-cluster pod in the monitoring namespace.
+Out: architecture. No change is proposed to api/main.py or to the scaling
+     mechanism - no concurrency semaphore, no swapping the CPU HPA for a KEDA
+     Prometheus scaler. The point of the run is to produce numbers so those
+     decisions get made from measurement instead of estimate. Also out: the read
+     path (/jobs/{id} polling), resilience testing (spot interruption, AZ loss),
+     and any public entry point, which does not exist.
+
+LABELS USED BELOW
+[repo]     read directly from a file in this repository, cited file:line.
+[derived]  arithmetic from [repo] values.
+[estimate] engineering estimate, to be replaced by a measurement from this run.
+[verify]   needs one command against the live system; the command is in section 14.
+[measured] measured on a workstation on 2026-09-13 while building the generator,
+           not on this cluster. Section 16 records the command and the numbers.
+[was]      a figure this plan originally carried that later work found wrong.
+           The original wording is kept verbatim next to the correction, because
+           the plan is a record of what was believed and when, not only a set of
+           instructions.
+
+STATE OF THE WORLD THIS PLAN ASSUMES
+k8s-audit.txt:16-22 records that nothing has ever been applied: no cluster, no
+ArgoCD sync, bootstrap-overlay.sh never run. CLAUDE.md names the first real
+terraform apply as the next milestone. So this plan CANNOT be executed until
+RUNBOOK Phases 0-3 are complete (infra applied, platform applied, IAM DB users
+created, overlay bootstrapped, ArgoCD syncing). Every number below is derived
+from the repository, not observed. Stage 0 re-derives each one from the live
+cluster before any load is sent, because a deployed overlay can differ from the
+repo: the repo values are what SHOULD be live, the run manifest records what IS.
+
+Note also that docs/DESIGN.md:126-133 already reports a load test (446 MiB api /
+106 MiB worker at the caps) and docs/DESIGN.md:154-157 three gaps it found. Since
+no cluster has existed, those figures came from something other than this
+cluster. Re-deriving them is a named deliverable, not a side effect.
+
+WHAT WAS RUN (writing this plan)
+Nothing. The three test files and the terraform read-only loop are on the allow
+list in CLAUDE.md, but the two moto-based tests write api/test.db and
+worker/worker_test.db, and this session was planning-only, so none was executed.
+NOT RUN: api/smoke_test.py, worker/test_processing.py, worker/integration_test.py,
+terraform fmt, terraform validate, terraform init -backend=false, kustomize build,
+kubeconform, scripts/validate-manifests.sh, shellcheck, git beyond `git ls-files`.
+No aws, kubectl, curl, plan or apply - none of those are available here anyway.
+Every statement in this plan is static reading of the repository plus arithmetic.
+Running the three test files is pre-flight step 1 (section 8).
+
+
+1. THE NUMBERS, FROM THE REPO
+
+/jobs SCHEMA                api/main.py:105-116
+  JobSubmission.records: list[SaleRecord], min_length=1, max_length=50_000
+  SaleRecord: region str<=64 | null, amount float | null, sale_date str<=32 |
+  null, order_id str<=64 | null; model_config allow_inf_nan=False (main.py:106).
+  All four fields default to None, so a record can be entirely null and still
+  parse - it is process_batch that rejects it.
+  Responses: 202 JobAccepted (main.py:204), 500 "could not record job"
+  (main.py:227), 502 "could not store batch" (main.py:214) and "could not
+  enqueue job" (main.py:240).
+
+RECORD CAP                  50,000 per batch                  api/main.py:115
+
+MAX_BODY_BYTES              env, default 10*1024*1024 = 10,485,760 B (10 MiB)
+                                                              api/main.py:41
+  Enforced by middleware BEFORE parsing (api/main.py:151-165): POST/PUT/PATCH
+  with no Content-Length -> 411; unparseable or negative -> 400; over cap -> 413.
+
+MAX_S3_BYTES                env, default 15*1024*1024 = 15,728,640 B (15 MiB)
+                                                              worker/worker.py:62
+  Checked against s3.head_object ContentLength; over cap -> _mark_failed and
+  delete the message (worker.py:174-184).
+
+NEITHER VAR IS SET IN PROD  the app-config ConfigMap carries only
+  AWS_DEFAULT_REGION, SQS_QUEUE_URL, S3_BUCKET, DB_IAM_AUTH, DB_HOST, DB_PORT,
+  DB_NAME - so both code defaults apply in the cluster.
+                                          k8s/overlays/prod/kustomization.yaml:13-23
+
+API RESOURCES               requests == limits: cpu "1", memory 1Gi
+                                    k8s/base/app/03-api-deployment.yaml:72-78
+API REPLICAS / STRATEGY     3; RollingUpdate maxUnavailable 0, maxSurge 1
+                                    03-api-deployment.yaml:8-14
+API SERVER                  uvicorn main:app - ONE worker process per pod, no
+  --limit-concurrency                             api/Dockerfile.api:18
+API HPA                     minReplicas 3, maxReplicas 10, Resource cpu
+  Utilization 70% (of the 1-CPU request, so 700m/pod)
+                                    03-api-deployment.yaml:92-109
+API SERVICE                 ClusterIP, port 8000 -> 8000, NO sessionAffinity
+  (field absent, so it defaults to None)          03-api-deployment.yaml:80-90
+
+WORKER RESOURCES            requests == limits: cpu 500m, memory 512Mi
+                                    k8s/base/app/04-worker-deployment.yaml:56-62
+WORKER REPLICAS / GRACE     1 in Git; terminationGracePeriodSeconds 60
+                                    04-worker-deployment.yaml:8,21
+WORKER RECEIVE LOOP         MaxNumberOfMessages=1, WaitTimeSeconds=20
+                                    worker/worker.py:243-247
+
+KEDA SCALEDOBJECT           minReplicaCount 0, maxReplicaCount 20,
+  cooldownPeriod 120, trigger aws-sqs-queue with queueLength "5"; no
+  pollingInterval set, so KEDA's 30s default applies
+                                    k8s/base/app/05-worker-scaledobject.yaml:16-26
+
+NODEPOOL on-demand          limits.cpu "16"; node label capacity=on-demand; no
+  taint                             k8s/base/platform/09-karpenter-nodepools.yaml:29,48-49
+NODEPOOL spot               limits.cpu "32"; node label capacity=spot; taint
+  capacity-spot=true:NoSchedule     09-karpenter-nodepools.yaml:68,74-77,91-92
+BOTH POOLS' REQUIREMENTS    on-demand/spot, amd64, instance-category t|m|c|r,
+  instance-generation > 2           09-karpenter-nodepools.yaml:35-47,78-90
+KARPENTER DISRUPTION        both pools: WhenEmptyOrUnderutilized,
+  consolidateAfter 1m, budget nodes "10%", plus a Drifted-only nodes "0" budget
+  at 04:00 for 23h                  09-karpenter-nodepools.yaml:50-58,93-101
+
+RDS                         db.t4g.medium (2 vCPU / 4 GiB), Postgres major "16",
+  MULTI-AZ, gp3 20 GB with max_allocated_storage 100, storage encrypted with the
+  CMK, IAM database authentication enabled, Performance Insights enabled,
+  backup_retention 7                terraform/modules/data/main_data.tf:181-216
+                                    terraform/modules/data/variables_data.tf:35-44
+RDS max_connections         NOT SET. There is no aws_db_parameter_group anywhere
+  in modules/data, so the instance uses default.postgres16, whose value is
+  LEAST({DBInstanceClassMemory/9531392}, 5000). For a 4 GiB class that is
+  approximately 410-450 depending on how much RDS reserves. [derived] [verify]
+
+SQS jobs QUEUE              visibility_timeout_seconds = var (default 300),
+  message_retention_seconds 345,600 (4 days), KMS CMK, redrive to the DLQ with
+  maxReceiveCount = var (default 3)  main_data.tf:105-115
+                                     variables_data.tf:46-55
+SQS DLQ                     message_retention_seconds 1,209,600 (14 days)
+                                     main_data.tf:98-103
+DLQ ALARM                   ApproximateNumberOfMessagesVisible > 0, Maximum,
+  period 300, evaluation_periods 1, treat_missing_data notBreaching, action =
+  the image-scan SNS topic           main_data.tf:364-380
+
+DB CONNECTION POOLS         api pool_size=5, max_overflow=10, pool_pre_ping=True
+  -> up to 15 connections per pod    api/main.py:59-65 (IAM path), :73-78
+                              worker pool_size=2, max_overflow=5,
+  pool_pre_ping=True -> up to 7 per pod            worker/worker.py:80-86,94-96
+  SQLAlchemy's pool_timeout is not overridden anywhere, so the default 30s
+  applies. That number matters; see section 3.2.
+
+INJECTION ALLOWANCE         NetworkPolicy allow-api-ingress: podSelector
+  app=api, from namespaceSelector kubernetes.io/metadata.name=monitoring, TCP
+  8000. Alongside default-deny-ingress and default-deny-egress, all of which the
+  kustomization scopes to the sales-pipeline namespace.
+                                    k8s/base/app/11-networkpolicy.yaml:1-27
+                                    k8s/base/app/kustomization.yaml:4
+  The vpc-cni addon has enableNetworkPolicy = "true", so these are enforced.
+                                    terraform/modules/cluster/main_cluster.tf:23-34
+
+AUTOSCALERS vs GITOPS       the ArgoCD Application declares ignoreDifferences on
+  /spec/replicas for both the api and worker Deployments, so selfHeal will NOT
+  fight the HPA or KEDA.            k8s/argocd/application.yaml:31-41
+  syncPolicy is automated with prune: true and selfHeal: true (:17-24).
+
+MONITORING NODE GROUP       ONE c5.xlarge, min = max = desired = 1; label
+  role=monitoring; taint role=monitoring:NO_SCHEDULE
+                                    terraform/modules/cluster/variables_cluster.tf:61-79
+                                    terraform/modules/cluster/main_cluster.tf:86-114
+BOOTSTRAP NODE GROUP        three c5.xlarge, min = max = desired = 3; label
+  role=bootstrap; taint role=bootstrap:NO_SCHEDULE
+                                    variables_cluster.tf:41-59; main_cluster.tf:56-85
+CLUSTER VERSION             1.36                variables_cluster.tf:11-14
+
+PROMETHEUS                  250m/1Gi requests == limits, retention 15d, nodeSelector
+  role=monitoring, and NO storageSpec - combined with the absence of an EBS CSI
+  addon (main_cluster.tf:22-54) that means emptyDir.
+                                    terraform/modules/platform/main_platform.tf:338-357
+                                    terraform/modules/platform/variables_platform.tf:20-23
+METRICS-SERVER              requests cpu 100m, limits MEMORY ONLY - no CPU limit,
+  so HPA metric freshness will not be throttled.  main_platform.tf:75-86
+OTEL COLLECTOR              single replica, 250m/256Mi requests == limits,
+  memory_limiter at 80%, nodeSelector role=monitoring - i.e. it competes for the
+  same one node as the load generator.
+                                    k8s/base/platform/12-otel-collector.yaml:1-22
+  The api and worker both carry instrumentation.opentelemetry.io/inject-python
+  (03-api-deployment.yaml:23, 04-worker-deployment.yaml:18) exporting to
+  http://otel-collector.opentelemetry:4318 (07-instrumentation.yaml:8-20).
+TEMPO                       250m/500Mi requests, 500m/1Gi limits
+                                    main_platform.tf:541-555
+FLUENT BIT                  200m/200Mi requests == limits, tolerates everything
+                                    main_platform.tf:588-611
+PODMONITORS                 api port http /metrics and worker port metrics
+  /metrics, both at interval 30s     k8s/base/platform/08-podmonitor.yaml
+ALERTMANAGER ROUTE          every alert to the SNS receiver except alertname
+  Watchdog and severity=info, both blackholed. group_wait 30s.
+                                    main_platform.tf:264-298
+
+VPC FLOW LOGS               traffic_type = "ALL", destination CloudWatch Logs,
+  KMS CMK, 14-day retention          terraform/modules/network/flowlogs_network.tf:42-48
+                                     variables_network.tf:43-46
+VPC ENDPOINTS               S3 GATEWAY endpoint plus two ECR interface endpoints
+  (ecr.api, ecr.dkr). Nothing else - SQS, RDS-IAM signing traffic and CloudWatch
+  all ride the NAT.                  terraform/modules/network/endpoints_network.tf:21-45
+AZs / NAT                   az_count = 2, single_nat = true, enable_nat = true
+                                     terraform/variables.tf:18-34
+
+SMOKE.SH TIMEOUTS           readiness 10 iterations x sleep 2 (~20s);
+  job-completion poll 15 iterations x sleep 2 (~30s)
+                                     smoke.sh:7-18, 38-54
+
+
+2. WHAT THESE NUMBERS ALREADY SETTLE, BEFORE ANY LOAD IS SENT
+
+2.1 THE RECORD CAP BINDS FOR COMPACT RECORDS; MAX_BODY_BYTES FOR FAT ONES. [derived]
+A compact generated record - {"region":"West","amount":123.45,"sale_date":
+"2026-01-01","order_id":"000000000001"} - is 84 bytes, 85 with its separating
+comma, so body(n) is about 85n + 13 bytes.
+  n =  1,000  ->     85,013 B  ~=  83 KiB
+  n = 50,000  ->  4,250,013 B  ~= 4.05 MiB, well under the 10 MiB body cap.
+  10,485,760 / 85 = 123,362 records, so for compact records the 50,000-record cap
+  (api/main.py:115) binds first.
+At maximum field widths a serialized record is at most 236 bytes: 64 + 32 + 64
+characters of string content, plus at most 24 characters of float repr (Python
+and serde both emit shortest-round-trip, bounded at 24; inf and nan are blocked
+by allow_inf_nan=False), plus keys, quotes, colons and commas. 10,485,760 / 237
+is about 44,240 records, so for maximal records MAX_BODY_BYTES binds first. Both
+caps are reachable; which one you meet depends on record width, and the load test
+should state which one it exercised.
+
+2.2 MAX_S3_BYTES CANNOT BE REACHED THROUGH /jobs. AT ALL. [derived]
+The stored object is submission.model_dump_json().encode("utf-8")
+(api/main.py:209), i.e. the compact re-serialization of the validated model. A
+serialized record is at most 237 bytes including its separator (2.1), and the
+record cap is 50,000, so the object is at most 11,850,000 B = 11.3 MiB - always
+below the 15 MiB cap in worker/worker.py:62. The worker's guard defends against
+objects placed by some path other than the API. This load test cannot exercise
+it and must not be reported as having done so.
+
+2.3 NOTHING IN THIS SYSTEM RETURNS 503 ON /jobs. [derived]
+See 3.2 for the full argument and its consequences for the counter design.
+
+2.4 THE CONNECTION BUDGET IS NOT THE RDS CEILING. [derived]
+api 15 per pod x 10 pods = 150; worker 7 per pod x 20 pods = 140; total 290 with
+both autoscalers at maximum, plus superuser_reserved_connections (default 3) and
+any psql pod. Against approximately 410-450 that leaves roughly 30-35% headroom.
+RDS will therefore appear as LATENCY, not as refused connections. And because
+pool_pre_ping=True on both engines (api/main.py:63, worker/worker.py:84), each
+request costs an extra SELECT 1 round trip: the DB sees about 2 statements per
+/jobs and about 3 per processed message. That doubling, not the connection count,
+is what makes RDS latency the risk worth watching.
+
+2.5 KEDA'S maxReplicaCount BINDS WELL BEFORE THE SPOT POOL'S CPU LIMIT. [derived]
+20 workers x 500m = 10,000m of pod requests. Even on 4-vCPU nodes that is 3-4
+nodes, i.e. 12,000-16,000m of node capacity, against the spot pool's 32,000m
+limit. The spot pool will not be the constraint. KEDA's 20 will.
+
+2.6 ON THE API SIDE THE HPA MAX AND THE NODEPOOL CPU LIMIT NEARLY COINCIDE, AND
+WHICH ONE BINDS IS DECIDED BY KARPENTER'S INSTANCE CHOICE. [derived]
+NodePool.spec.limits.cpu caps the summed vCPU of the nodes the pool owns (the
+value reported in .status.resources), not the sum of pod requests.
+  - If Karpenter picks 4-vCPU instances: allocatable is about 3,920m, minus about
+    80m kube/system reserved, minus DaemonSets - fluent-bit 200m [repo],
+    kube-proxy about 100m [verify], aws-node about 25m [verify], node-exporter
+    about 0 - leaving about 3,595m, so THREE api pods per node. Ten pods needs
+    four nodes = 16,000m, which is EXACTLY the pool limit. The two ceilings land
+    on top of each other.
+  - If Karpenter picks 8-vCPU instances: two nodes = 16,000m with about 7,590m
+    usable each, so seven pods per node and a 14-pod capacity - the HPA's 10
+    binds with headroom.
+This is the single most valuable thing the run resolves, and it is invisible
+without running it. Record the instance types Karpenter actually chose.
+
+2.7 QUEUE DEPTH IS NOT A KNOB YOU CAN SET. [derived]
+KEDA's aws-sqs-queue scaler counts visible plus in-flight by default
+(scaleOnInFlight; [verify] against KEDA 2.20.2, variables_platform.tf:5-8). With
+W replicas each holding one message in flight (MaxNumberOfMessages=1,
+worker.py:245), equilibrium is desired = ceil((visible + W)/5) = W, which means
+visible is about 4W. To hold 20 replicas you need a sustained visible backlog of
+about 80 messages. You get there only by making arrival rate exceed drain rate,
+so the KEDA axis is driven by message rate versus per-message time - never set
+directly. If the observed depth diverges from 4W, the scaleOnInFlight assumption
+is wrong, and that is worth knowing.
+
+2.8 COLD SCALE-FROM-ZERO IS 90-195s, SO SMOKE.SH'S 30s JOB POLL IS GUARANTEED TO
+FALSE-FAIL. [derived]
+KEDA polling default 30s, so 0-30s to notice the message; spot NodeClaim to node
+Ready 45-90s [estimate]; ECR image pull via the interface endpoint 20-60s
+[estimate]; Python plus boto3 import and the first receive_message 5-15s
+[estimate]. smoke.sh:38-54 allows 15 iterations of sleep 2, about 30 seconds.
+The note in the brief is arithmetically correct. Section 8 removes the cold start
+rather than changing smoke.sh.
+
+2.9 DETECTION LAG ON A FAILING MESSAGE IS ABOUT 15 MINUTES. [derived]
+visibility_timeout 300s x maxReceiveCount 3 means a message that fails on every
+receive takes at least 15 minutes to reach the DLQ, and the dlq-not-empty alarm
+then needs one 300s period (main_data.tf:364-380). The DLQ is a LAGGING abort
+signal. It confirms; it never trips first.
+
+2.10 THE WHOLE METRICS AND TRACE STORE IS EPHEMERAL, AND PROMETHEUS IS A
+PLAUSIBLE CASUALTY OF THIS TEST. [derived]
+No EBS CSI addon exists (main_cluster.tf:22-54) and kube-prometheus-stack has no
+storageSpec, so Prometheus, Grafana and Tempo are all on emptyDir. Prometheus has
+a 1 GiB memory limit and a 250m CPU limit while it is about to see a burst of new
+scrape targets: up to 10 api pods, 20 worker pods, and about seven new nodes each
+bringing node-exporter and cAdvisor series. A Prometheus restart loses the entire
+run history. That is why the observer in section 7 writes its own independent CSV
+and treats Prometheus as a cross-check, not as the record of truth.
+
+
+3. THE THREE DESIGN POINTS CARRIED INTO THIS PLAN
+
+3.1 THE HTTP CLIENT MUST DISABLE KEEP-ALIVE - AGREED, WITH TWO ADDITIONS.
+The mechanism is right. EKS kube-proxy in iptables mode makes its DNAT decision
+at connection establishment, selecting randomly across the ready endpoints, so a
+keep-alive client pins its traffic to whichever pod answered first and pods the
+HPA adds never receive anything - which would silently invalidate the whole test.
+[verify] the mode once (section 14); iptables is the EKS default, and IPVS or
+nftables behave the same way for this purpose.
+
+Two things to carry alongside it.
+
+(a) The Service has NO sessionAffinity (03-api-deployment.yaml:80-90 - the field
+is absent, so it defaults to None). That is the OTHER way this test could
+silently pin, and it is currently safe. Assert it in the run manifest so a future
+change to it cannot invalidate a comparison against this run's numbers.
+
+(b) The cost lands on conntrack, not on client ports. With Connection: close,
+uvicorn is the ACTIVE closer, so TIME_WAIT accumulates on the api pods - where
+the local port is fixed at 8000, so there is no port exhaustion - while the
+generator's sockets are freed promptly. What does accumulate is conntrack entries
+on the generator's node: at 900 connections/s with a 60s TIME_WAIT that is about
+54,000 entries against nf_conntrack_max of 32,768 x 4 cores = 131,072 [derived]
+[verify], roughly 2.4x headroom. node-exporter already exposes
+node_nf_conntrack_entries and node_nf_conntrack_entries_limit, so this costs no
+new tooling. Put both series in the timeline.
+
+CONFIRMED BY MEASUREMENT, 2026-09-13. [measured] The active-closer half of that
+paragraph held exactly. At 4,000 fresh connections/s against a local target,
+with the client resolving each request when the server closed rather than
+closing first:
+
+  ss -tan state time-wait
+    server side (local port is the listener)   14,107
+    client side (peer port is the listener)         0
+
+So TIME_WAIT lands entirely on the listener, the client's ephemeral ports are
+freed as soon as the socket closes, and there is no client-side port exhaustion.
+This is a property of the client, not a law: if the generator ever calls close()
+before the server's FIN it becomes the active closer and 4,000 conn/s x 120s =
+480,000 client sockets in TIME_WAIT against roughly 28,000 ephemeral ports.
+loadtest/loadgen.py resolves every request in connection_lost for exactly this
+reason, and that is not a detail to refactor away.
+
+CORRECTED, 2026-09-13. [was] "at 900 connections/s with a 60s TIME_WAIT that is
+about 54,000 entries ... roughly 2.4x headroom". Two errors, one in the constant
+and one in the method.
+
+  1. The timeout is 120s, not 60s. nf_conntrack_tcp_timeout_time_wait defaults
+     to 120. kube-proxy overrides only --conntrack-tcp-timeout-established and
+     --conntrack-tcp-timeout-close-wait; it never touches time_wait.
+  2. rate x ttl only describes a steady state that has run longer than the
+     timeout. Entries alive at t are every connection opened in (t - 120, t],
+     which for a ladder of 45s rungs spans two or three EARLIER rungs as well.
+     Any rung shorter than the timeout has to be integrated, not multiplied.
+
+Redone: Stage B's 900 req/s top step is 900 x 120 = 108,000, which is 82% of the
+131,072 table - not 54,000 and not 2.4x headroom. It still fits, but the margin
+is 1.2x, and Stage A does not fit at all; section 5 has that derivation and the
+ladder it forced. nf_conntrack_max itself is unchanged and still [derived]
+[verify]: kube-proxy's conntrack maxPerCore default 32,768 x 4 vCPU = 131,072.
+
+The measurement distortion is one extra TCP handshake per request, about
+0.2-0.5 ms intra-VPC [estimate], against roughly 40 ms of S3/SQS/DB work per
+request - under 2%, acceptable.
+
+And the payoff: because every request is a fresh connection, the per-pod split is
+directly provable two independent ways -
+  sum by (pod) (rate(http_requests_total{handler="/jobs"}[1m]))  in Prometheus, and
+  distinct destination IPs per minute in VPC flow logs. The generator is on the
+  monitoring node and api pods are on Karpenter nodes, so the traffic always
+  crosses an ENI and is therefore logged (traffic_type ALL,
+  flowlogs_network.tf:44). That is the direct evidence that the keep-alive
+  decision worked, rather than an assumption that it did.
+
+3.2 TRACK 503 AND 500 AS SEPARATE COUNTERS - THE SPLIT IS RIGHT, THE PREMISE IS
+NOT, AND THE REFINEMENT MATTERS.
+
+I disagree that a 503 is available as a backpressure signal here, because nothing
+in this system can return 503 on /jobs.
+  - api/main.py:204-243 returns 202, 500 ("could not record job") and 502
+    ("could not store batch", "could not enqueue job").
+  - The body middleware returns 411, 400 or 413 (api/main.py:151-165).
+  - FastAPI returns 422 through the custom handler (api/main.py:178-181).
+  - The ONLY 503 in the codebase is /readyz (api/main.py:201).
+  - uvicorn emits 503 only under --limit-concurrency, which is not set
+    (api/Dockerfile.api:18).
+  - There is no ALB, no ingress controller and no service mesh. The Service is
+    ClusterIP (03-api-deployment.yaml:80-90) and the generator addresses it
+    directly. docs/DESIGN.md:144-152 records the public entry point as
+    deliberately removed.
+  - If every api pod went NotReady, kube-proxy with zero endpoints REJECTs the
+    connection. It does not synthesize a 503.
+
+So in this system the backpressure signals are:
+  - CONNECT TIMEOUT - uvicorn's accept backlog (default 2048) is full and the
+    kernel is dropping SYNs. This is the genuine "offered load exceeds capacity"
+    signal, and it carries no HTTP status at all.
+  - 500 WHOSE LOG LINE CONTAINS "QueuePool limit of size 5 overflow 10 reached,
+    connection timed out" - SQLAlchemy's default 30s pool_timeout expiring
+    (api/main.py:61-62, :227). That is SATURATION, not a bug, and it arrives as
+    a 500.
+  - 500 FROM ANYTHING ELSE - that is a bug, and cutting the rate will not fix a
+    bug. The distinction is the whole point of the split, so it has to survive
+    into the data.
+
+Which means the counter design must be richer than 503-versus-500, and it must
+live on the client:
+  - one counter per EXACT status: 202, 400, 411, 413, 422, 500, 502, other;
+  - one counter per TRANSPORT failure class: connect-refused, connect-timeout,
+    read-timeout, connection-reset;
+  - one counter named offered_dropped - requests the generator wanted to send but
+    could not because its in-flight cap was reached (section 6). Without this,
+    "we could not offer the rate" gets misread as "the system handled the rate";
+  - and the 500s get split AFTER the run by grepping the api's own log lines in
+    CloudWatch for QueuePool: saturation-500 versus bug-500.
+
+Server-side metrics cannot do this job. prometheus-fastapi-instrumentator 7.0.0
+(api/api_requirements.txt:7) is created bare - Instrumentator().instrument(app)
+at api/main.py:148 - so metrics.default() applies, and its should_group_status_codes
+defaults to True, which means http_requests_total very likely carries
+status="5xx" rather than "500", collapsing 500 and 502 into one series. [verify]
+with the single command in section 14. This is consistent with the alert rule
+itself, which matches status=~"5.." (13-prometheus-rules.yaml:42) - a pattern
+that matches both "500" and "5xx". Either way, the client-side counters are the
+authoritative per-code source and Prometheus is the cross-check, not the reverse.
+
+3.3 PRE-GENERATE PAYLOADS AT STARTUP - AGREED, AND IT IS PROVABLY SAFE HERE.
+Build 8 pre-serialized bytes bodies per (n, rejection-mix) pair at startup and
+round-robin them, so the generator never serializes inside the request loop and
+its own CPU does not become the bottleneck.
+
+Reuse is valid because dedupe is PER BATCH: seen_order_ids is a local set created
+fresh inside each process_batch call (worker/processing.py:34), so the same body
+submitted a thousand times yields identical and correct rejection counts every
+time. Write that down, because if dedupe were global, reuse would silently
+corrupt the test and someone would eventually "improve" the generator into doing
+it.
+
+Two mechanical points. Content-Length must be exact, which pre-serialized bytes
+give for free and which the middleware reads before parsing (api/main.py:154-162).
+Memory: 8 bodies at n = 50,000 is about 34 MB - exactly 8 x 4,250,013 =
+34,000,104 B, which was right - and all five C1 ladder sizes resident at once is
+68.7 MB. [measured] [was] "about 40 MB", wrong by 1.7x: 8 bodies at each of
+n = 1,000 / 5,000 / 15,000 / 30,000 / 50,000 is 8 x (85,013 + 425,013 +
+1,275,013 + 2,550,013 + 4,250,013) = 68,680,520 B. Every (n, rejection-mix) pair
+the whole plan needs, D2's 60%-malformed n = 1,000 and D's 25,000 included, is
+86,314,972 B = 86.3 MB, measured by serializing them. All three are comfortable
+inside a 2 GiB pod, so the error never changed a decision - but 40 MB is what a
+later reader would have sized a smaller pod against, and 86.3 MB is the number
+that actually bounds it.
+
+One honest caveat: 8 identically shaped bodies give the api perfect branch
+prediction and cache behaviour, so measured per-request CPU is a slight
+UNDER-estimate of real-world cost. Varying the 8 by order_id range, region
+string and which records are malformed keeps that small.
+
+
+4. INJECTION POINT - CONFIRMED, PLUS THE PART THAT IS NOT OBVIOUS
+
+The choice holds. allow-api-ingress (11-networkpolicy.yaml:10-27) selects
+podSelector app=api and permits TCP 8000 from namespaceSelector
+kubernetes.io/metadata.name=monitoring. That label is applied automatically by
+the API server to every namespace, so the monitoring namespace Helm creates
+(main_platform.tf:253-254) matches it with no manifest change. The rejected
+alternatives are rejected for the right reasons: a bastion cannot reach a
+ClusterIP and its source IP matches no selector, and port-forward is a single TCP
+stream pinned to one pod.
+
+Three consequences that are easy to get wrong.
+
+4.1 NAMESPACE IS NOT NODE PLACEMENT. The policy selects on namespace; where the
+pod runs is independent. A generator with no nodeSelector schedules onto an
+untainted Karpenter ON-DEMAND node - consuming the very 16-CPU budget being
+measured and competing with api pods for it. It must be pinned off that pool.
+
+4.2 BUT THE MONITORING NODE GROUP IS EXACTLY ONE c5.xlarge, min = max = 1
+(variables_cluster.tf:61-79). A generator with nodeSelector role=monitoring plus
+the matching toleration must FIT ON THAT ONE NODE. Nothing will scale it, and
+Karpenter will not provision for it either, because no NodePool template carries
+a role=monitoring label (09-karpenter-nodepools.yaml:28-29,67-68) - so an
+over-large request sits Pending forever with no event that says why.
+[was] "Estimated headroom [derived]: 3,920m allocatable, minus Prometheus 250m,
+Alertmanager 100m, Grafana 50m plus about 100m of sidecars, prometheus-operator
+about 100m, kube-state-metrics, Tempo 250m, the OTel collector 250m
+(12-otel-collector.yaml:16-22, also pinned to role=monitoring), fluent-bit 200m,
+kube-proxy about 100m, aws-node about 25m - about 1,425m used, leaving about
+2,495m. So requests == limits = 2 CPU fits, or two replicas of 1 CPU each."
+That sum is internally consistent, but three of its terms are wrong and the
+corrected figure is 325m tighter.
+
+  + 400m  PROMETHEUS AND ALERTMANAGER EACH CARRY A config-reloader SIDECAR.
+          main_platform.tf:338-353 sets prometheus.prometheusSpec.resources and
+          nothing anywhere sets prometheusOperator.prometheusConfigReloader
+          .resources, so the chart default lands on both pods at 200m each.
+          [repo] that there is no override, [estimate] on the 200m default.
+  - 100m  PROMETHEUS-OPERATOR REQUESTS NOTHING. main_platform.tf:462-481 gives
+          it a nodeSelector and tolerations and no resources block at all, so
+          the chart default resources: {} applies. The 100m above was invented.
+  +  25m  AWS-NODE IS TWO CONTAINERS. enableNetworkPolicy = "true"
+          (main_cluster.tf:27) runs aws-eks-nodeagent alongside aws-node, each
+          defaulting to 25m. [estimate]
+
+CORRECTED HEADROOM [derived]: 1,750m requested against 3,920m allocatable
+leaves 2,170m free, not 2,495m. The two config-reloader defaults are the only
+soft terms: if the chart pinned at variables_platform.tf:15-18 ships them with
+no requests, the total is 1,350m and free CPU is 2,570m. The honest answer is a
+RANGE, 2,170m-2,570m. A 2-CPU request fits at the bottom of it with 170m to
+spare, which is inside the error bar on the [estimate] rows - so this is a
+number to confirm on the node, not to trust.
+
+MEMORY, WHICH THIS SECTION NEVER DERIVED [derived] [estimate]: roughly 6,830Mi
+allocatable on a c5.xlarge under the VPC CNI without prefix delegation, minus
+about 2,864Mi of requests, leaves about 3.9 GiB. Memory is not the binding
+constraint on this node; CPU is.
+
+WHAT THE GENERATOR ACTUALLY COSTS [measured], 2-second peaks, section 16:
+    1,000 req/s      615m
+    2,000 req/s      788m
+    4,000 req/s    1,373m
+Judged against the 85%-of-limit HOLD rule Stage B sets for the generator, which
+applies to it in every stage:
+                            limit 1,000m    limit 1,500m    limit 2,000m
+    1,000 req/s                  62%             41%             31%
+    2,000 req/s                  79%             53%             39%
+    4,000 req/s                 137%  NO          92%  NO         69%
+Only a 2-CPU limit carries the top rung. These are workstation numbers; a
+c5.xlarge core may cost up to 1.3x per request [estimate], which is the margin
+the table above has to absorb.
+
+WHAT TO DO WITH WHAT describe-node REPORTS. Read Allocatable cpu minus the
+Allocated resources cpu request total, then:
+
+  FREE >= 2,000m. Ship as written: requests == limits == cpu 2, memory 1Gi,
+    ephemeral-storage 1Gi. Full ladder to 4,000 req/s.
+
+  FREE 1,000m-2,000m. requests 1000m, limits 2000m, full ladder. Scheduling
+    tests only the request, so it fits; the 2-CPU limit leaves the top rung
+    unthrottled. The price is Burstable QoS instead of the requests == limits
+    Guaranteed idiom this repo uses everywhere else, and a request is a
+    reservation rather than a measure of use - so whether 2 CPU is really free
+    at the moment of the 4,000 rung is [verify] with kubectl top node during
+    the earlier rungs. This is only acceptable because the generator prints its
+    own CPU and cfs_throttled_periods every 15s: if the throttle counter moves
+    during the 4,000 rung, that rung is void, and you rerun it capped rather
+    than reading throttled latency samples as api behaviour.
+
+  FREE < 1,000m, or you will not take Burstable QoS. requests == limits ==
+    cpu 1, and CAP THE LADDER AT 1,000 req/s - 62% of that limit measured, or
+    80% if the c5 core really costs 1.3x, which is inside the 85% rule but not
+    by much. 2,000 req/s sits at 79% measured, under the rule, but with no
+    margin at all: 788m x 1.3 is 1,024m, over a 1,000m limit outright. Take
+    the 2,000 rung at 1 CPU only if you will watch the throttle counter, and
+    treat that rung as void if it moves.
+
+  THE POD WILL NOT SCHEDULE EVEN AT 1 CPU. Stop and say so. Do not move the
+    generator to the bootstrap node group; 4.3 says why and that has not
+    changed. Free capacity on the monitoring node, or accept that Stage A
+    cannot be run from inside this cluster as it is built.
+
+WHAT A 1,000 req/s CAP COSTS. Stage A's second purpose survives intact: the
+api's framework floor is a per-request cost fitted across rungs, and 200 / 500 /
+1,000 still gives three points for a + b*rate. What is lost is the first
+purpose - the generator's own demonstrated ceiling stops at 1,000 req/s instead
+of being found - and with it the chance of driving three api pods to the
+ceiling of their 404 path, which is where the HPA excursion Stage A rehearses
+actually lives. One thing is gained: at a 1,000 req/s cap the conntrack problem
+in section 5 disappears. 200 / 500 / 1,000 run BACK TO BACK peak at 73,500
+entries, 56% of the table, so the 130s gaps become unnecessary and Stage A
+shrinks from 725s to 135s. Those gaps exist only to make the 2,000 and 4,000
+rungs survivable.
+
+TWO REPLICAS OF 1 CPU EACH IS NOT A SUBSTITUTE, despite the sentence this
+section originally ended on. Two replicas mean two independent stdout streams
+of gen.csv, two offered_dropped counters, two T0 latches, two emptyDirs and two
+kubectl cp targets - and the 22-column schema in section 7 has no replica
+column and no defined merge rule. The generator solves the same problem inside
+one pod with two worker processes and one set of counters.
+
+Confirm before T0 with the describe-node command in section 14.
+
+4.3 THE BOOTSTRAP NODE GROUP IS THE TEMPTING WRONG ANSWER. Three c5.xlarge with
+roughly 6 vCPU free would give far more headroom, and a monitoring-namespace pod
+may legally run there (the policy still permits it, since the policy is
+namespace-scoped). Do not. That is where Karpenter, KEDA and ArgoCD live, and
+KEDA's operator, metric server and webhooks all have 100m requests against 1000m
+limits (main_platform.tf:117-168) - squeezing them distorts exactly the scaling
+latency this test exists to measure.
+
+IMAGE. Use public.ecr.aws/docker/library/python:3.12-slim with the script mounted
+from a ConfigMap. Not Docker Hub: one shared NAT IP (single_nat = true,
+terraform/variables.tf:30-34) against anonymous pull limits. Not ECR: both
+repositories are image_tag_mutability = "IMMUTABLE" and CI-pinned
+(main_data.tf:1-25), so a third repository would be a Terraform change, which is
+out of scope for a calibration run. Image pulls happen at the kubelet, not
+subject to NetworkPolicy, and ride the NAT like every other platform image
+(docs/DESIGN.md:56-60).
+
+SECURITY CONTEXT. The monitoring namespace carries no Pod Security Admission
+labels (Helm created it, main_platform.tf:253-254; only the sales-pipeline
+namespace is labelled restricted, 00-namespace.yaml:7-11), so nothing is forced.
+Run non-root with dropped capabilities anyway - the generator needs no privileged
+access, no host network and no AWS credentials, so no IRSA role and therefore no
+Terraform change.
+
+LIFECYCLE. Hand-apply into monitoring. ArgoCD prunes only resources carrying its
+tracking label, so an untracked Deployment is invisible to prune: true - and
+equally, nothing will ever clean it up. Deleting it is a manual teardown step
+(section 14).
+
+
+5. THE RAMP SHAPE, AND THE REASONING FOR IT
+
+SEQUENCE FIRST, THEN TOGETHER. Three reasons.
+
+(1) They confound. Request rate drives api CPU and therefore the HPA; batch size
+drives per-message worker time; queue depth drives KEDA - but batch size ALSO
+drives per-request api CPU, because Pydantic validation is O(n) in the record
+count. Ramping both at once means a ceiling appears with no way to attribute it
+to either axis.
+
+(2) The batch-size effect is nonlinear and would swamp the rate axis. At
+n = 50,000 the per-request api CPU is roughly 50x that at n = 1,000 [estimate],
+so a combined ramp is really a batch-size ramp wearing a rate ramp's clothes.
+
+(3) But a combined stage is still REQUIRED, because the two halves share one RDS
+instance, one NAT, one OTel collector, one Fluent Bit DaemonSet and two node
+pools. Cross-half contention only exists when both are hot, and that is the only
+stage in which an RDS ceiling can realistically appear.
+
+STEP LENGTH: 5 MINUTES for any step whose result depends on autoscaling.
+Derived from the slowest link in a scale-up: metrics-server resolution about 15s,
+HPA sync 15s, pod created, then if no node capacity exists a Karpenter NodeClaim
+at 45-90s [estimate], an ECR pull at 20-60s [estimate], and readiness at
+initialDelaySeconds 5 plus periodSeconds 10 (03-api-deployment.yaml:60-65) -
+about 2-3 minutes worst case. Add the for: 5m and [5m] windows in
+13-prometheus-rules.yaml:42-50 and 5 minutes is the shortest step that both
+reaches steady state and can fire an alert.
+
+STAGE A - GENERATOR SELF-CALIBRATION. 12.1 min. Zero AWS cost.
+[was] "10 min. GET a non-existent path (/__loadgen_ping, which returns 404) at
+200, 500, 1,000, 2,000 and 4,000 req/s, 45s each." That ladder cannot be run as
+written - it exhausts the conntrack table on the generator's node partway
+through the 2,000 req/s rung, and it does so in the one way that would invert
+the result rather than degrade it. The derivation is CONNTRACK below. The rungs
+that are shipped, in loadtest/config-calibration.json:
+
+     200 req/s    45s
+     idle        130s
+     500 req/s    45s
+     idle        130s
+   1,000 req/s    45s
+     idle        130s
+   2,000 req/s    45s
+     idle        130s
+   4,000 req/s    25s
+   ------------------
+   total         725s
+
+GET a non-existent path (/__loadgen_ping, which returns 404). No request body,
+no S3, no SQS, no DB. This measures two things: the generator's own ceiling, and
+the api's framework floor - FastAPI plus uvicorn plus OTel per-request overhead
+with the handler's work removed. Subtracting that floor from Stage B's
+per-request CPU decomposes the api cost, which no other stage can do.
+Use a 404 path rather than /healthz deliberately: /healthz is the liveness probe
+path (03-api-deployment.yaml:66-71, timeoutSeconds defaulting to 1,
+failureThreshold 3), so hammering it can time the probe out and restart the
+container. If you do want the router-matched path measured, run one short
+/healthz step and watch RESTARTS - a restart there is a real finding about the
+liveness probe sharing a loaded path, not a test artifact.
+Stage A is also a free rehearsal of the entire HPA path, since 404s still burn
+api CPU, at no AWS cost whatsoever.
+
+CONNTRACK FORCED THE GAPS AND THE SHORT TOP RUNG. [derived] Keep-alive is off
+(3.1), so every request is a new 5-tuple, and each one holds a conntrack entry
+on the generator's node for 120s after it closes (3.1b, corrected).
+Entries alive at t are every connection opened in (t - 120, t]. Integrating the
+ORIGINAL back-to-back ladder against nf_conntrack_max = 131,072:
+
+   t = 135.0s   end of the 1,000 rung        73,500     56% of the table
+   t = 167.4s   32.4s into the 2,000 rung   131,100     TABLE FULL
+   t = 180.0s   end of the 2,000 rung       150,000    114%
+   t = 225.0s   end of the 4,000 rung       300,000    229%
+
+The table fills at t = 167.4s, 12.6 seconds before the 4,000 rung begins at
+t = 180s. That is why checking the top rung alone misses it: the rung that
+breaks the run is the 2,000 one, and it breaks because of what the 500 and
+1,000 rungs left behind in the window.
+
+And the failure mode is the worst one available to this test. A full conntrack
+table drops SYNs. The generator sees no HTTP status at all and records a CONNECT
+TIMEOUT - and 3.2 names connect timeout as THE genuine "offered load exceeds
+capacity" signal, the one that means uvicorn's accept backlog is full. A
+node-local resource limit on the generator's own node would be read as the api
+saturating. That is not a degraded measurement, it is an inverted one, and it
+would be recorded as the headline finding of the run.
+
+The 130s gaps let each rung's 120s window decay completely before the next
+starts, so every rung stands alone and its peak is just rate x duration:
+
+     200 x 45 =    9,000     6.9% of the table
+     500 x 45 =   22,500    17.2%
+   1,000 x 45 =   45,000    34.3%
+   2,000 x 45 =   90,000    68.7%
+   4,000 x 25 =  100,000    76.3%      45s here would be 180,000 = 137%
+
+Only the top rung still needed shortening. 25s holds it at 76%.
+
+THE COST OF THE SHORT RUNG, STATED PLAINLY. PodMonitors scrape at 30s
+(08-podmonitor.yaml), so a 25s rung yields one scrape or none. The generator's
+own numbers for that rung are unaffected - it writes gen.csv every second - but
+the api-side per-pod CPU at 4,000 req/s will be thin to absent, and that is
+exactly the point on the curve Stage A exists to pin down.
+
+THE ALTERNATIVE, WHICH IS BETTER IF YOU WILL TAKE IT. Raise nf_conntrack_max on
+the single monitoring node before T0 and set the top rung's duration_s back to
+45. 262,144 carries 45s at 4,000 req/s with 31% headroom. It is one sysctl on
+one node, it is reversible, and it buys back the only measurement this ladder
+gives up. The shipped config takes the no-touch option because it must be safe
+to apply without a node change, not because it is the better experiment.
+
+[verify] BEFORE T0, on the monitoring node - the whole ladder shape rests on two
+values that are assumed defaults:
+   sysctl net.netfilter.nf_conntrack_max
+   sysctl net.netfilter.nf_conntrack_tcp_timeout_time_wait
+and watch node_nf_conntrack_entries against node_nf_conntrack_entries_limit on
+the timeline throughout the run (3.1b). If entries approach the limit during any
+rung, that rung's connect-timeout count is not a finding about the api.
+
+STAGE C2a - KEDA COLD START. 10 min. RUNS BEFORE STAGE B, because it needs the
+worker genuinely at 0 replicas, which only holds before any sustained load.
+With the worker idle past cooldownPeriod 120, inject 500 messages at n = 1,000 as
+fast as the api will take them (about 2s at 250 req/s), then stop dead. 500 is
+comfortably above the roughly 100 needed to reach maxReplicaCount (2.7), so this
+exercises the full 0-to-20 ramp. Measures: notice latency, the 0-to-1 activation,
+the ramp shape (the KEDA-managed HPA's default scale-up policy is max(4 pods,
+100%) per 15s), whether 20 is actually reached, the drain rate at 20 replicas,
+and then the whole scale-down and return to zero.
+
+STAGE B - RATE RAMP AT FIXED n = 1,000. 45 min.
+83 KiB bodies: large enough that Pydantic validation is a measurable share of
+per-request CPU, small enough that worker time stays around 45 ms [estimate] so
+the queue stays shallow at the low end.
+Baseline 5 req/s for 5 min, then 20, 50, 100, 200, 350, 500, 700, 900 req/s at
+5 min each.
+Ladder rationale: 3 pods x 700m = 2,100m of CPU before the HPA moves, so with
+per-request CPU of X ms the first scale-up lands at about 2,100/X req/s - 210
+req/s at X = 10 ms, 105 at X = 20 ms [derived]. The interesting band is 100-500
+and the ladder brackets it. The top is deliberately placed past the estimated
+10-pod ceiling (roughly 700-1,000 req/s at X = 10 ms [estimate]) so the ladder is
+guaranteed to cross it rather than stopping just short.
+Per-step stop rule: if the 202 rate stops tracking the offered rate by more than
+5%, or generator CPU exceeds 85% of its limit, HOLD the step and record. Do not
+escalate into a measurement that cannot be attributed.
+Expect KEDA to scale during Stage B as well, and do not try to prevent it -
+changing maxReplicaCount would be a mechanism change and a Git commit through
+ArgoCD. Stage B's ceiling claim is about the API only, evidenced by per-pod CPU,
+HPA desired versus max, and 202-rate versus offered-rate. If the backlog grows
+without bound at the top of the ladder, that is not noise; see 6.4.
+
+STAGE C1 - WORKER COST CURVE. 25 min plus about 10 min of settling after B.
+Fixed low MESSAGE rate so exactly one worker is involved and neither autoscaler
+moves: n = 1,000 / 5,000 / 15,000 at 2 req/s, then n = 30,000 / 50,000 at 1
+req/s, 4 min each. At n = 50,000 one worker drains about 2.2 msg/s [estimate], so
+1 req/s keeps visible depth at or below 4 and KEDA's desired stays at 1; if it
+scales to 2, halve the rate and redo the step. On the api side, n = 50,000 at
+1 req/s is about 0.4 CPU-seconds/s across 3 pods [estimate], so the HPA also
+stays put - the stage is clean on both halves.
+Deliverables: worker_processing_seconds p50/p95 per n (buckets run to 30s,
+worker.py:36), peak worker RSS per n, and - because the api rate is fixed while n
+varies - the per-record slope of api CPU.
+
+STAGE C2b - KEDA EQUILIBRIUM. 20 min. Sustained 150 msg/s at n = 1,000 for
+15 min. At about 20 msg/s per worker [estimate] that needs roughly 8 replicas, so
+this tests the equilibrium relation rather than the cap: predicted visible depth
+about 4 x 8 = 32 (2.7). A divergence from 4W falsifies the scaleOnInFlight
+assumption, which is itself a useful result.
+
+STAGE D - COMBINED. 25 min. Rate at 70% of Stage B's MEASURED api ceiling, with a
+mixed batch size: 80% at n = 1,000, 15% at n = 5,000, 5% at n = 25,000, giving a
+mean of about 2,800 records per request [derived]. Hold 20 min. This is the only
+stage in which RDS, the NAT, both node pools, the OTel collector and Fluent Bit
+are all hot simultaneously.
+
+STAGE D2 - ALERTING-PATH TEST. 15 min. r = 50 req/s, n = 1,000, with 60% of
+records deliberately malformed, held 13 min. Purpose: fire
+HighRecordRejectionRate (>20% for a for: 10m window,
+13-prometheus-rules.yaml:19-29) on purpose, in isolation, at trivial load - so
+the alert's cause is unambiguous and the Alertmanager-to-SNS path is proven.
+Every other stage runs at about 2% rejection: below the threshold, so the
+rejection counters and the rejection_breakdown labels are exercised without the
+alert crying wolf across the whole run. D2 is the first thing to cut if the run
+is behind schedule; C2b is second.
+
+STAGE E - RELEASE AND SCALE-DOWN. 30 min. See 6.5. Load to zero, observer still
+running, no abort.
+
+TOTAL IN-CLUSTER RUNNING TIME: 192 minutes. [was] 190, when Stage A was 10
+minutes; the conntrack gaps added 2.1. The T+210 abort in 9.1 is unchanged and
+still unconditional, so the pad narrows from 20 minutes to 18.
+
+
+6. WHICH CEILING FIRST, AND HOW THE RESULTS TELL THEM APART
+
+6.1 RANKED PREDICTION
+(1) api CPU driving the HPA to maxReplicas 10. The HPA starts moving in the
+    100-350 req/s band; the cap is reached somewhere in 700-1,000 req/s offered
+    [estimate].
+(2) The on-demand NodePool's 16-CPU limit, essentially simultaneously - a coin
+    flip on Karpenter's instance choice (2.6).
+(3) RDS appears as rising commit latency long before either cap, and converts
+    into api 500s (QueuePool timeout) only at the very top. Multi-AZ
+    (main_data.tf:201) means every commit waits on the standby's WAL write, which
+    is a hard serialization point on a 2-vCPU burstable instance. RDS T3/T4g
+    classes run in unlimited mode by default, so the instance will DEGRADE
+    SMOOTHLY and bill for surplus CPU rather than throttle. Do not expect a knee.
+(4) KEDA's maxReplicaCount 20, well before the spot pool's 32 CPU (2.5).
+(5) The generator itself - the one failure that would silently invalidate
+    everything, which is why Stage A exists and why generator CPU is a
+    first-class series in the timeline.
+
+6.2 DISCRIMINATION TABLE - what each ceiling looks like in the data
+
+HPA CAP
+  primary:      kubectl -n sales-pipeline get hpa api shows REPLICAS 10 and
+                condition ScalingLimited=True with reason TooManyReplicas; ALL
+                TEN PODS ARE Running; per-pod CPU pinned at about 1000m.
+  corroborating: container_cpu_cfs_throttled_seconds_total climbing (requests ==
+                limits, so throttling is certain at the cap); KubeHpaMaxedOut
+                firing; 202 rate flat while offered rate keeps rising.
+
+NODEPOOL CPU LIMIT
+  primary:      api pods PENDING with FailedScheduling; kubectl get nodepool
+                on-demand -o jsonpath='{.status.resources.cpu}' equals 16; the
+                Karpenter controller log says the pool would exceed its limits.
+  corroborating: KubeDeploymentReplicasMismatch and KubePodNotReady; HPA desired
+                greater than current with no pod ever reaching Ready.
+  This is the row that distinguishes it from the HPA cap: at the HPA cap every
+  pod runs; at the NodePool limit some pod never schedules.
+
+RDS
+  primary:      RDS CloudWatch CPUUtilization, DBLoad, WriteLatency,
+                DatabaseConnections; api p99 latency rising while api CPU is NOT
+                pinned; api log line "failed to record job: QueuePool limit ...
+                timed out" producing 500s (api/main.py:226-227).
+  corroborating: Performance Insights top SQL is the jobs INSERT; commit latency
+                tracks the Multi-AZ round trip.
+
+KEDA CAP
+  primary:      kubectl get hpa keda-hpa-worker shows 20/20; visible queue depth
+                grows on a straight line at a constant slope.
+  corroborating: spot NodePool .status.resources.cpu far below 32 (2.5).
+
+GENERATOR
+  primary:      generator container CPU at or above 90% of its limit; offered
+                rate plateaus while client p50 latency stays flat;
+                offered_dropped greater than zero.
+  corroborating: api CPU BELOW the HPA target and the HPA not scaling - the tell
+                that the client, not the system, is the bottleneck.
+
+6.3 TWO SECONDARY CEILINGS WORTH WATCHING FOR
+
+READINESS CASCADE. /readyz (api/main.py:189-201) makes three network calls - a DB
+SELECT 1 through the SHARED pool, an SQS get_queue_attributes and an S3
+head_bucket - with timeoutSeconds defaulting to 1 and failureThreshold 3
+(03-api-deployment.yaml:60-65). Under pool exhaustion it will exceed 1s, pods go
+NotReady after about 30s, the Service endpoint set shrinks, and the survivors get
+worse. Track READY ENDPOINT COUNT as a first-class series. If every replica is
+unavailable for 5 minutes, APIUnavailable fires
+(13-prometheus-rules.yaml:51-58) - a real outcome, not a false alarm. Liveness is
+safe: /healthz returns a static dict and touches nothing (api/main.py:184-186),
+so pods will not be killed by this.
+
+THE OBSERVABILITY PATH SATURATING. The api's OTel auto-instrumentation exports a
+span per request to a single-replica collector with a 250m CPU limit and a
+memory_limiter at 80% (12-otel-collector.yaml:16-22,31-36), feeding Tempo at 500m
+(main_platform.tf:541-555). At peak this will drop spans. That is a finding about
+the tracing path's capacity, NOT a reason to disable instrumentation - production
+runs with it, so the test must too, and its per-request overhead is part of what
+is being measured. Same for Fluent Bit: at peak the pipeline emits roughly 1,300
+log lines/s (one per accepted job at api/main.py:242, one per processed message at
+worker.py:205-214) into a 200m CPU DaemonSet. Dropped lines are a finding.
+
+6.4 THE FINDING I MOST EXPECT
+api ingest capacity at 10 pods (roughly 700-1,000 req/s) against worker drain
+capacity at 20 replicas (roughly 400 msg/s at n = 1,000) [estimate] - a 1.5x to
+2x MISMATCH IN FAVOUR OF INGEST. Nothing is lost, because retention is 4 days
+(main_data.tf:108), but the pipeline would accept work about twice as fast as its
+maximum drain rate. If that holds, it is the most actionable number in the run,
+and Stage E measures the drain side directly rather than by estimate.
+
+6.5 SCALE-DOWN, OBSERVED RATHER THAN ASSUMED
+Four independent mechanisms, in sequence. Record the wall-clock of each
+transition; the INTERVALS are the deliverable, not the end state.
+
+(1) BACKLOG DRAIN. Load stops, workers stay at 20 and drain. N/T from the
+    observer's queue-depth series IS the authoritative worker fleet drain rate -
+    the cleanest measurement in the whole plan, and it comes free from the
+    scale-down stage.
+(2) API HPA. The default downscale stabilization window is 300s, after which the
+    default policy permits halving every 15s, so 10 -> 5 -> 3 within about 30-45s
+    of the window closing. Predicted: first down-step at load_stop + about 300s,
+    back to 3 by about +375s [derived]. The HPA's own AbleToScale condition
+    message names the stabilization window explicitly - capture it verbatim.
+(3) WORKER: HPA THEN KEDA. The ScaledObject declares no
+    advanced.horizontalPodAutoscalerConfig.behavior
+    (05-worker-scaledobject.yaml:13-26), so the KEDA-managed HPA uses the same
+    300s stabilization to step down; then KEDA takes it from its floor to 0 once
+    the trigger has been inactive for cooldownPeriod 120. KEDA emits
+    KEDAScaleTargetDeactivated. Observer artifact to expect: at 0 replicas the
+    worker HPA columns read <unknown>. That is not a sampling failure.
+(4) KARPENTER. consolidateAfter 1m with budget nodes "10%"; 10% of 4 nodes rounds
+    up to 1 [verify], so disruption is SERIALIZED at one node per action. Tearing
+    down about 4 on-demand plus about 3 spot nodes is therefore about seven
+    sequential actions - roughly 10-20 minutes after load stops [derived]. The
+    api PDB (minAvailable 2, 10-pdb.yaml:1-9) applies to consolidation drains but
+    not to HPA scale-down, and at 3 replicas it permits them.
+
+Capture during E: kubectl get events sorted by lastTimestamp; kubectl get
+nodeclaims -w; the Karpenter controller log lines naming empty or underutilized;
+and describe output for the HPA and the ScaledObject.
+The daily nodes "0" Drifted budget at 04:00 for 23h
+(09-karpenter-nodepools.yaml:55-58) blocks drift-driven disruption almost always
+and does NOT affect consolidation. Do not read it as a scale-down blocker.
+
+
+7. THE OBSERVER
+
+The priority is a correlated timeline of load-sent versus system-response, not
+latency percentiles. So: TWO CSVs JOINED ON EPOCH SECONDS, plus a run manifest.
+Percentiles are recorded but secondary.
+
+timeline.csv - 10 SECOND CADENCE, written from the operator's workstation through
+the SSM tunnel (RUNBOOK "Accessing the private cluster"). 10s resolves a 15s HPA
+step and a 30s KEDA poll without being noisy. Five API calls per tick, assembled
+by jq into one row, about 1s of work per tick:
+
+  ts,api_desired,api_ready,api_pending,api_endpoints_ready,
+  hpa_api_cur_pct,hpa_api_desired,hpa_api_limited,
+  worker_desired,worker_ready,worker_pending,keda_hpa_cur,keda_hpa_desired,
+  sqs_visible,sqs_notvisible,dlq_visible,
+  nodes_ondemand,nodes_spot,nodeclaims_notready,np_od_cpu,np_spot_cpu,
+  api_cpu_sum_m,api_cpu_max_m,api_mem_max_mi,
+  worker_cpu_sum_m,worker_mem_max_mi,gen_cpu_m,gen_mem_mi,
+  sample_ok
+
+Two caveats to keep with the file so the plot is not misread. The CPU and memory
+columns come from metrics-server, whose resolution is about 15s, so they LAG
+their own row's timestamp by up to 15 seconds - which matters on a 10s timeline.
+And sample_ok flags ticks where a call failed: the SSM tunnel can drop, so the
+observer must APPEND, leaving a visible gap on reconnect rather than losing the
+file.
+
+gen.csv - 1 SECOND CADENCE, written by the generator to STDOUT so Fluent Bit
+ships it to CloudWatch and it survives the pod dying. One line per second is
+free:
+
+  ts,stage,offered,sent,offered_dropped,inflight,
+  h202,h400,h411,h413,h422,h500,h502,hother,
+  e_conn_refused,e_conn_timeout,e_read_timeout,e_reset,
+  lat_p50_ms,lat_p95_ms,lat_max_ms,bytes_sent,records_sent
+
+gen-requests.ndjson - PER REQUEST, to the pod's emptyDir:
+{ts, job_id, status, n, ms}. Retrieved at the end with kubectl cp. This is what
+makes the DB-side timeline reconstruction in section 8 possible - job_id is the
+join key, and no off-the-shelf load tool produces it, which is the decisive reason
+to use a purpose-built generator rather than vegeta or hey. If disk or CPU
+becomes a problem, fall back to sampling 1 request in 10; that is a pre-planned
+lever and must be recorded in the manifest when used, never applied silently.
+
+events.log - the operator's own timestamped notes, one line per observation
+(echo "$(date -u +%s) ..."). Stage boundaries and anything surprising.
+
+run-manifest.json - captured at T0 BEFORE any load: every value in section 1 as
+read from the LIVE cluster, plus the deployed image SHA, the region, the
+Karpenter instance types actually in use, max_connections, the kube-proxy mode,
+the Service's sessionAffinity, and the jobs/results row counts and epoch second
+that form the reconciliation baseline.
+
+POST-RUN PULLS, NOT LIVE SAMPLERS, for RDS: CloudWatch backfills, so sampling
+live buys nothing and costs API calls. One aws cloudwatch get-metric-data over
+the whole window at 60s period for CPUUtilization, DatabaseConnections,
+WriteLatency, ReadLatency, FreeableMemory, WriteIOPS and DBLoad. SQS is the
+opposite case and IS sampled live: get-queue-attributes is near-real-time and far
+better than CloudWatch's 1-5 minute granularity for queue depth.
+
+FROM PROMETHEUS AFTER THE RUN, as cross-check and not as source of truth (2.10):
+  - sum by (pod) (rate(http_requests_total{handler="/jobs"}[1m])) - the per-pod
+    distribution, i.e. the proof that disabling keep-alive worked;
+  - container_cpu_cfs_throttled_seconds_total for both workloads;
+  - container_memory_max_usage_bytes - a since-container-start HIGH-WATER MARK,
+    so it captures a peak that a 30s scrape would miss. This is the correct way
+    to re-derive docs/DESIGN.md:130-132's 446 MiB and 106 MiB figures. [verify]
+    that the kubelet's cadvisor endpoint exposes it;
+  - node_nf_conntrack_entries and node_nf_conntrack_entries_limit (3.1b);
+  - ALERTS{alertstate="firing"} with timestamps.
+
+THE PRIMARY VIEW is one stacked plot sharing a single x-axis with stage
+boundaries marked:
+  top    - offered / 202 / each error class / offered_dropped
+  middle - api desired vs ready vs pending, ready endpoint count, on-demand node
+           count
+  bottom - SQS visible plus in-flight, worker desired vs ready, spot node count
+  strip  - generator CPU, which is the honesty check on every row above it.
+
+
+8. WHERE SMOKE.SH FITS AS A CORRECTNESS ORACLE
+
+BEFORE, AGAINST DOCKER-COMPOSE - WHERE IT WAS DESIGNED TO RUN.
+docker compose up, then ./smoke.sh (CLAUDE.md "Commands"), plus the three test
+files. This proves the CODE computes 350.5 total, 3 processed and 3 rejected
+(smoke.sh:60-63) before the cluster gets blamed for anything. Unmodified, in its
+intended environment, where its 20s readiness and 30s job-poll budgets are
+correct because localstack and a local Postgres answer immediately. This is
+pre-flight step 1 and costs nothing.
+
+AFTER, IN-CLUSTER - UNMODIFIED, BUT PRE-WARMED.
+2.8 has the arithmetic: 15 iterations of sleep 2 (about 30s, smoke.sh:38-54)
+against a 90-195s cold KEDA scale-from-zero is a guaranteed false-fail. Do not
+change smoke.sh - it is the pre-flight oracle and its docker-compose timings are
+correct for that job. Remove the cold start instead:
+  1. submit one throwaway batch from the generator pod;
+  2. kubectl -n sales-pipeline wait --for=condition=Ready pod -l app=worker
+     --timeout=300s
+  3. kubectl -n sales-pipeline port-forward deploy/api 18000:8000 &
+  4. API_URL=http://localhost:18000 ./smoke.sh
+With a warm worker already blocked in a 20s long poll (worker.py:243-247), SQS
+delivers immediately and the job reaches done in about 2-4s - two of the fifteen
+available poll iterations.
+
+Port-forward is the right tool HERE and the wrong tool for load, exactly as the
+brief says: it pins to one pod, which is fine for a correctness assertion and
+fatal for a distribution measurement. It should work despite default-deny-ingress,
+because the kubelet's readiness and liveness probes already reach port 8000 from
+the node, which proves node-sourced traffic to that port is permitted. [verify]
+If it turns out to be blocked, fall back to a curl-capable pod in the monitoring
+namespace issuing the same three requests.
+
+RECONCILIATION IS THE ORACLE THAT ACTUALLY SCALES. smoke.sh checks six records;
+this checks a million and a half, from one psql session (section 14):
+
+  SELECT count(*) FILTER (WHERE status='pending') AS pending,
+         count(*) FILTER (WHERE status='done')    AS done,
+         count(*) FILTER (WHERE status='failed')  AS failed,
+         count(*)                                  AS jobs
+    FROM jobs WHERE submitted_at >= to_timestamp(:t0);
+
+  SELECT count(*) AS results, sum(rows_processed) AS processed,
+         sum(rows_rejected) AS rejected
+    FROM results r JOIN jobs j USING (job_id)
+   WHERE j.submitted_at >= to_timestamp(:t0);
+
+Assertions: jobs equals the generator's 202 count; done equals results;
+processed + rejected equals the sum of n over accepted jobs; pending is 0 after
+the drain; failed is 0 - and any non-zero failed is a finding, with the api and
+worker log lines saying which of the two _mark_failed paths caused it
+(api/main.py:246-258, worker/worker.py:222-234).
+
+Because the jobs table carries submitted_at and completed_at
+(api/main.py:86-92) and the worker sets completed_at on first write
+(worker.py:136-140), the per-job end-to-end latency for EVERY job comes from one
+query after the run. That is why the plan does NOT poll /jobs/{id} during the
+run: polling would add api and RDS load and distort the very measurement being
+taken.
+
+And the idempotency proof under real load, free from the metrics:
+worker_jobs_processed_total{outcome="redelivery_skipped"} greater than zero means
+SQS redelivered and the ON CONFLICT DO NOTHING path absorbed it - the design
+claim at docs/DESIGN.md:32-38, demonstrated rather than asserted.
+
+
+9. HARD DEADLINE, ABORT PATH, AND WHAT THE RUN COSTS
+
+9.1 HARD WALL-CLOCK DEADLINE
+192 minutes of in-cluster stages (section 5; [was] 190, before Stage A's
+conntrack gaps added 2.1). UNCONDITIONAL ABORT AT T+210 MINUTES (3.5 hours)
+from the first load packet, whatever state the run is in.
+Stage 0 (about 30 minutes, docker-compose only, no AWS) and the post-run
+reconciliation sit outside that clock. Total operator time is about 5 hours.
+If the run is behind schedule, cut D2 first, then C2b. Never cut Stage E: a run
+without the scale-down observation is missing the drain-rate measurement (6.5)
+and leaves nodes up.
+
+9.2 PRE-COMMITTED ABORT TRIGGERS
+Decided now, so they are not decided under pressure:
+  - any api pod OOMKilled -> STOP. That is a real ceiling; pushing past it
+    measures nothing.
+  - api 500s whose log line does NOT contain QueuePool -> STOP. That is a bug
+    (3.2), and cutting the rate does not fix a bug.
+  - DLQ depth greater than 0 -> STOP and investigate. But remember it lags about
+    15 minutes (2.9), so it is a confirmation and never the tripwire.
+  - RDS FreeableMemory below 200 MB -> STOP. This protects the one stateful thing
+    in the system.
+  - Prometheus pod restarts -> STOP and redo the stage. On emptyDir its history
+    is gone (2.10).
+  - wall clock past T+210 -> STOP.
+
+9.3 ABORT PATH
+  # 1. Stop the load. One command, does not depend on the pods behaving.
+  kubectl -n monitoring scale deploy/loadgen --replicas=0
+  # 2. Hard stop.
+  kubectl -n monitoring delete deploy loadgen
+
+Then LET THE BACKLOG DRAIN - that is the right default. Retention is 4 days
+(main_data.tf:108) so nothing is lost, KEDA holding 20 workers on spot to drain
+costs about $0.18/hour [estimate], and draining preserves the reconciliation.
+Only if you must stop immediately:
+  aws sqs purge-queue --queue-url "$QURL"    # destroys in-flight work; once per 60s
+and then record that reconciliation is void for that run.
+Do NOT hand-delete NodeClaims or the ArgoCD Application - RUNBOOK "Teardown"
+(RUNBOOK.md:356-369) explains why that ordering matters. Consolidation reclaims
+the capacity on its own within 10-20 minutes (6.5).
+
+9.4 WHAT THE RUN COSTS IN AWS TERMS AT PEAK
+Request and byte counts are [derived] from the section 5 ladder: about 1.51M
+accepted jobs and about 219 GB written to S3 across all stages. Dollar figures
+are [estimate] against us-east-1 list prices from memory - the region comes only
+from the AWS_REGION GitHub variable (RUNBOOK.md:40-42), so confirm against the
+pricing calculator for your actual region before quoting any of these.
+
+  S3 PUT                          1.51M requests              $7.55
+  S3 storage (30-day lifecycle,
+    main_data.tf:84-96)           219 GB x 1 month            $5.04
+  SQS requests                    about 4.6M                  $1.84
+  Cross-AZ transfer (generator
+    in one AZ, api spread over
+    two by topologySpread)        about 110 GB x $0.02        $2.20
+  S3 GET + HEAD (worker)          about 3.0M                  $1.21
+  Karpenter on-demand nodes       about 20 vCPU-hours         $0.85
+  VPC flow logs                   about 0.55 GB               $0.30
+  CloudWatch Logs, pod logs       about 0.45 GB               $0.23
+  NAT data (SQS and CloudWatch
+    ride the NAT,
+    endpoints_network.tf:21-45)   about 5 GB                  $0.23
+  RDS T4g unlimited-mode surplus  about 1.6 vCPU-hours        $0.14
+  Karpenter spot nodes            about 8 vCPU-hours          $0.12
+  EBS on ephemeral nodes, KMS
+    (Bucket Keys on,
+    main_data.tf:46)                                        under $0.10
+  ---------------------------------------------------------------------
+  MARGINAL TOTAL                                        about $20
+                                                        (range $15-30)
+
+Separately, the baseline that runs whether or not you test - EKS control plane,
+RDS Multi-AZ, the NAT, four managed c5.xlarge, four ECR-endpoint ENIs - is about
+$3.50 over 3.5 hours. Do not book it as test cost.
+
+Three cost notes worth writing down because they surprise people.
+
+  (a) S3 PUTs plus storage are 63% of the bill. If cost matters, the lever is
+      REQUEST COUNT, not duration: cutting Stage B's top three steps to 3 minutes
+      and Stage D to 10 minutes removes about 546,000 requests (36%) and saves
+      about $7, at the price of less time held at the ceiling. That is the budget
+      variant; take it deliberately or not at all.
+
+  (b) The no-keep-alive decision MULTIPLIES VPC FLOW-LOG VOLUME roughly 1:1 with
+      requests. traffic_type = "ALL" (flowlogs_network.tf:44) plus a fresh
+      5-tuple per request means about 2 records per request instead of about 2
+      per long-lived connection: about 3.7M records, about 0.55 GB. Small in
+      dollars, and genuinely USEFUL - it is the independent proof that
+      connections spread across all ten api pod IPs (3.1).
+
+  (c) RDS T3/T4g classes run in UNLIMITED mode by default, so sustained CPU above
+      the 20%-of-2-vCPU baseline bills surplus rather than throttling. Small,
+      real, and the line item nobody predicts.
+
+
+10. WHICH ALERTS I EXPECT TO FIRE
+
+From k8s/base/platform/13-prometheus-rules.yaml, plus kube-prometheus-stack
+88.6.1's shipped kubernetes-mixin defaults (variables_platform.tf:15-18), plus
+the one CloudWatch alarm. The Alertmanager route sends everything to the SNS
+receiver except alertname Watchdog and severity=info, both blackholed
+(main_platform.tf:264-298), so "fires" and "emails you" are the same thing except
+for the info band. The exact default rule set should be confirmed with the
+ALERTS query in section 14 rather than trusted from memory.
+
+EXPECTED TO FIRE, AND WANTED
+  HighRecordRejectionRate (warning, 13-prometheus-rules.yaml:19-29) - fired
+    DELIBERATELY in Stage D2. Greater than 20% rejections sustained for a for: 10m
+    window. The cleanest available end-to-end test of Prometheus -> Alertmanager
+    -> SNS -> email, at trivial load and unambiguous cause.
+  KubeHpaMaxedOut (warning, mixin default) - HPA at maxReplicas for 15 minutes.
+    Fires if Stage B or D holds the cap long enough, which is the intent.
+  WorkerJobFailures (warning, 13-prometheus-rules.yaml:12-18) -
+    increase(...{outcome="failed"}[10m]) > 0 with NO for: clause, so any single
+    failed job in a 10-minute window fires it. Likely at least once under load.
+    Note the gap docs/DESIGN.md:155-156 already records: both _mark_failed paths
+    in worker/worker.py:177-193 (oversized object, non-list records) return True
+    WITHOUT incrementing JOBS_PROCESSED, so neither can ever fire this alert.
+    That gap stays unproven by this run, because 2.2 shows the oversized path is
+    unreachable through /jobs at all.
+  CPUThrottlingHigh (info, so blackholed - no email, but visible in the
+    Alertmanager UI) - guaranteed, because both workloads have requests == limits
+    (03-api-deployment.yaml:72-78, 04-worker-deployment.yaml:56-62).
+
+FIRES ONLY IF A SPECIFIC CEILING IS HIT - WHICH IS THE POINT
+  KubeDeploymentReplicasMismatch / KubePodNotReady (mixin defaults) - fire if api
+    pods sit Pending, which is the NodePool-CPU-limit signature (6.2).
+  APIHighErrorRate (critical, 13-prometheus-rules.yaml:40-50) - greater than 5%
+    5xx on client handlers for 5 minutes. Fires if pool-timeout 500s sustain.
+    Note it cannot tell 500 from 502: status=~"5.." matches the grouped 5xx label
+    as well as a bare code (3.2).
+  APIUnavailable (critical, :51-58) - fires only if EVERY replica is unavailable
+    for 5 minutes, i.e. the readiness cascade in 6.3 runs all the way. A real
+    outcome, not a false alarm, and worth provoking-by-accident rather than
+    provoking on purpose.
+  dlq-not-empty CloudWatch alarm -> SNS (main_data.tf:364-380) - fires if any
+    message survives three receives, e.g. a worker OOMing repeatedly on the same
+    batch. Lags about 15 minutes (2.9).
+
+EXPECTED NOT TO FIRE, WHICH IS ITSELF A RESULT
+  WorkerProcessingSlow (:30-37) - p95 above 10s for 10 minutes.
+    docs/DESIGN.md:154-155 already records this threshold as about 100x above
+    observed reality, i.e. about 0.1s, and nothing in this plan produces a
+    ten-second batch: even n = 50,000 is about 0.45s [estimate]. MEASURING THE
+    REAL p95 SO THIS THRESHOLD CAN BE RE-SET IS A NAMED DELIVERABLE (section 12),
+    not a side effect of the run.
+  APIScrapeMissing (:67-74, absent for 10 minutes) and APIDown (:59-66, up == 0
+    for 2 minutes) - terminating pods go STALE, not to zero, and the 2-minute
+    for: clause should absorb the single failed scrape when Karpenter removes a
+    node during Stage E. If APIDown fires during consolidation, that threshold is
+    worth revisiting and is a finding in its own right.
+
+VERIFY BEFORE T0, OR THE WHOLE ALERTING TEST PROVES NOTHING
+RUNBOOK.md:111-116 warns that an unconfirmed SNS subscription is
+indistinguishable from no alerting at all. The list-subscriptions command is in
+section 14; a SubscriptionArn of PendingConfirmation means no email will arrive
+no matter what fires.
+
+
+11. WHAT THIS TEST CANNOT TELL YOU
+
+  - NOTHING ABOUT A PUBLIC ENTRY POINT, because there is not one. ALB, WAF, a
+    custom domain, ACM and Cognito are all deliberately deferred
+    (docs/DESIGN.md:144-152). The measured api ceiling excludes any
+    ingress-layer cost, so it is not a production capacity number for a
+    public-facing version of this system.
+  - NOTHING ABOUT MAX_S3_BYTES. 2.2 proves the API cannot produce an object large
+    enough to trip it. The worker's 15 MiB guard stays untested by this run and
+    must not be reported otherwise.
+  - NOTHING ABOUT RESILIENCE. No Spot interruption, no AZ loss, no NAT failure.
+    With az_count = 2 and single_nat = true (terraform/variables.tf:18-34) those
+    failure modes exist and this plan does not touch them. A deliberate Spot
+    interruption is a separate test, and it is the one that would actually
+    exercise the idempotency argument in docs/DESIGN.md:82-86.
+  - NOTHING ABOUT SUSTAINED BEHAVIOUR. Three and a half hours says nothing about
+    memory growth over days, autovacuum and bloat on a jobs table taking 1.5M
+    rows per run, log-group cost drift, S3 lifecycle behaviour, or T4g credit
+    dynamics over a week.
+  - NOTHING ABOUT THE READ PATH. /jobs/{id} and /jobs/{id}/result polling is
+    deliberately excluded to keep the write-path measurement clean (section 8),
+    so the run does not measure read cost or the share of the 15-connection
+    per-pod DB pool that real polling clients would take. If clients poll, the
+    connection and CPU budgets in 2.4 change.
+  - WHERE THE API'S CPU ACTUALLY GOES. It finds WHERE the ceiling is, not WHAT to
+    optimise. Splitting per-request CPU across Pydantic validation, boto3 request
+    signing, uvicorn and the OTel span needs a profiler, and that is not a small
+    add: py-spy needs SYS_PTRACE, which the restricted Pod Security Admission
+    labels on the namespace forbid (00-namespace.yaml:7-11). Stage A's framework
+    floor is the only decomposition this plan delivers.
+  - WHETHER THE CPU HPA IS THE RIGHT SIGNAL. It shows what the HPA DOES. The
+    decision needs the latency-versus-CPU curve this run produces plus a
+    judgement call; the run is the input to that decision, not the answer. The
+    same is true of whether a concurrency limit is warranted - this run tells you
+    what happens without one.
+  - THAT ALERTS WHICH DID NOT FIRE WOULD WORK. It exercises the SNS path for the
+    rules that fire. WorkerProcessingSlow, APIScrapeMissing and, if the readiness
+    cascade does not happen, APIUnavailable all stay unverified.
+  - PORTABILITY OF ANY NUMBER HERE. They are specific to the region, the AZ pair,
+    the instance types Karpenter chose, and this image SHA. If Karpenter picks a
+    different family next time, the per-pod ceiling moves and 2.6's coin flip may
+    land the other way. That is why the run manifest records instance types.
+
+
+12. WHAT THE RUN PRODUCES
+
+ 1. API PER-REQUEST CPU MODEL, cpu_ms(n) = a + b*n - from Stage B (fixed n,
+    varying rate) and C1 (fixed rate, varying n), with Stage A's framework floor
+    subtracted. This lets you predict HPA behaviour for any traffic shape without
+    re-testing, and it is the most reusable output of the run.
+ 2. WORKER PER-MESSAGE MODEL, t_msg(n) = c + d*n, and peak RSS(n) from
+    container_memory_max_usage_bytes - a direct re-check of docs/DESIGN.md:130-132.
+ 3. Measured api saturation rate at 3 replicas and at 10.
+ 4. Which ceiling bound first, with the 6.2 evidence recorded - in particular
+    whether Karpenter's instance choice made the NodePool limit binding (2.6).
+ 5. HPA reaction latency (rate step -> first new pod Ready) and Karpenter
+    provisioning latency (NodeClaim -> node Ready -> pod Ready), broken out
+    separately rather than as one blended number.
+ 6. KEDA cold-start latency and the 0-to-20 ramp shape (Stage C2a).
+ 7. Worker fleet drain rate at 20 replicas, measured in Stage E rather than
+    estimated.
+ 8. The ingest-divided-by-drain cap mismatch ratio (6.4).
+ 9. Actual worker p95 processing time -> the correct value for
+    WorkerProcessingSlow, replacing the 10s in 13-prometheus-rules.yaml:31.
+10. Peak RDS connections, CPU, commit latency, and the real headroom to
+    max_connections (2.4).
+11. Peak conntrack on the generator node, and the per-pod request distribution -
+    the proof that disabling keep-alive worked.
+12. Which alerts fired, when, and whether the SNS email actually arrived.
+13. Reconciliation: submitted versus done versus failed, records processed versus
+    sent, and the redelivery count as the idempotency proof under load.
+14. Actual marginal cost from Cost Explorer the next day, against the 9.4
+    estimate - which also calibrates future cost estimates for this system.
+
+
+13. DOC DRIFT THIS RUN WILL CREATE
+
+Flagged, not written - documentation in this project is the owner's to write.
+
+  docs/DESIGN.md:126-133 ("The limits are measured, not guessed") - the 446 MiB
+    and 106 MiB figures get replaced by measurements from a real cluster rather
+    than from whatever produced them, since no cluster existed. 2.2 also means
+    the passage should distinguish the api's 50,000-record cap (reachable and
+    measurable) from the worker's 15 MB S3 cap (not reachable through /jobs), so
+    that a reader does not infer both were re-measured the same way.
+  docs/DESIGN.md:154-157 (the three open gaps) - WorkerProcessingSlow gets a real
+    threshold, and the un-incremented failure counter's blast radius is now
+    precisely known: both paths at worker/worker.py:177-193, one of which is
+    unreachable from the API (2.2).
+  RUNBOOK.md:373-379 ("Cost note") - currently names only the always-on pieces.
+    A load run's marginal cost is dominated by S3 requests and storage (9.4),
+    which that note does not mention.
+  k8s/README.md and .github/CICD_SETUP.md - no change expected, but both are
+    worth re-reading against the measured HPA and KEDA behaviour once the numbers
+    land, since either could describe the scaling story more precisely
+    afterwards.
+
+
+14. EXACT COMMANDS
+
+Written out because this plan was produced without aws or kubectl access. All of
+these need the SSM tunnel up per RUNBOOK "Accessing the private cluster"
+(RUNBOOK.md:131-151). The tunnel must survive 3.5 hours; the 10-second observer
+cadence keeps it non-idle, but plan for a reconnect and let the observer append
+(section 7).
+
+14.1 PRE-FLIGHT - CODE CORRECTNESS, NO AWS
+  cd <repo-root>
+  docker compose up -d && ./smoke.sh
+  ( cd api && python smoke_test.py )
+  ( cd worker && python test_processing.py && python integration_test.py )
+
+14.2 PRE-FLIGHT - BUILD THE RUN MANIFEST FROM THE LIVE CLUSTER
+  kubectl -n sales-pipeline get hpa api -o json \
+    | jq '{min:.spec.minReplicas,max:.spec.maxReplicas,metrics:.spec.metrics}'
+  kubectl -n sales-pipeline get scaledobject worker -o json \
+    | jq '{min:.spec.minReplicaCount,max:.spec.maxReplicaCount,
+           cooldown:.spec.cooldownPeriod,polling:.spec.pollingInterval,
+           triggers:.spec.triggers}'
+  kubectl -n sales-pipeline get hpa keda-hpa-worker -o json \
+    | jq '.spec.metrics,.spec.behavior'
+  kubectl get nodepool on-demand spot -o json \
+    | jq '.items[]|{name:.metadata.name,limits:.spec.limits,
+                    status:.status.resources,disruption:.spec.disruption}'
+  kubectl -n sales-pipeline get deploy api worker -o json \
+    | jq '.items[]|{name:.metadata.name,
+                    image:.spec.template.spec.containers[0].image,
+                    res:.spec.template.spec.containers[0].resources}'
+  kubectl -n sales-pipeline get svc api -o jsonpath='{.spec.sessionAffinity}{"\n"}'
+  kubectl -n sales-pipeline get cm -o json \
+    | jq '.items[]|select(.metadata.name|startswith("app-config"))|.data'
+  kubectl -n kube-system get cm kube-proxy-config -o yaml | grep -i '^[[:space:]]*mode'
+  kubectl describe node -l role=monitoring | sed -n '/Allocated resources/,/Events/p'
+  kubectl get nodes -L capacity,role -o wide
+  kubectl -n argocd get application sales-pipeline \
+    -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+
+14.3 THE ONE METRIC-LABEL QUESTION THAT DECIDES SECTION 3.2
+  POD=$(kubectl -n sales-pipeline get pod -l app=api -o name | head -1)
+  kubectl -n sales-pipeline exec "$POD" -- python -c \
+    "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/metrics').read().decode())" \
+    | grep '^http_requests_total' | head
+If the status label reads 2xx / 5xx rather than 200 / 500, Prometheus cannot
+separate 500 from 502 and the client-side counters are the only per-code source.
+
+14.4 AWS-SIDE FACTS
+  QURL=$(terraform -chdir=terraform output -raw sqs_queue_url)
+  aws sqs get-queue-attributes --queue-url "$QURL" --attribute-names All
+  aws rds describe-db-instances --db-instance-identifier sales-pipeline-db \
+    --query 'DBInstances[0].{class:DBInstanceClass,pgs:DBParameterGroups,
+             multiaz:MultiAZ,storage:AllocatedStorage,iops:Iops,
+             pi:PerformanceInsightsEnabled}'
+  aws sns list-subscriptions-by-topic \
+    --topic-arn "$(terraform -chdir=terraform output -raw image_scan_alerts_topic_arn)" \
+    --query 'Subscriptions[].{proto:Protocol,endpoint:Endpoint,arn:SubscriptionArn}'
+Note: terraform output needs the BACKEND-CONFIGURED init already run in
+./terraform (RUNBOOK.md:240-243); the -backend=false init cannot serve it.
+
+14.5 max_connections AND THE RECONCILIATION BASELINE
+  DBPW=$(aws secretsmanager get-secret-value \
+    --secret-id "$(terraform -chdir=terraform output -raw db_managed_password_secret_arn)" \
+    --query SecretString --output text | jq -r .password)
+  DBHOST=$(terraform -chdir=terraform output -raw rds_endpoint | cut -d: -f1)
+  kubectl -n monitoring run psql --rm -it --restart=Never \
+    --image=public.ecr.aws/docker/library/postgres:16 \
+    --env "PGPASSWORD=$DBPW" \
+    --overrides='{"spec":{"nodeSelector":{"role":"monitoring"},
+      "tolerations":[{"key":"role","operator":"Equal","value":"monitoring",
+                      "effect":"NoSchedule"}]}}' \
+    -- psql "host=$DBHOST port=5432 dbname=pipeline user=pipeline sslmode=require" -At \
+       -c "show max_connections" \
+       -c "select count(*) from pg_stat_activity" \
+       -c "select count(*) from jobs" \
+       -c "select count(*) from results" \
+       -c "select extract(epoch from now())::bigint"
+
+The password lands in the pod spec, so it is readable by anyone with pod-read
+RBAC in that namespace. Acceptable for a pre-production system, and the same
+shape as RUNBOOK Phase 1.5's psql pod (RUNBOOK.md:217-223), but delete the pod
+when done (--rm covers the happy path only) and do not reuse the shell.
+The nodeSelector plus toleration matter: without them the pod lands on a
+Karpenter on-demand node and consumes the 16-CPU budget being measured (4.1).
+The DB SG admits the private-subnet CIDRs (main_data.tf:165-179), which every
+pod IP comes from under the VPC CNI, so an in-cluster pod reaches it and a
+laptop over the NAT does not.
+
+14.6 OBSERVER LOOP - 10 SECONDS, APPENDING
+  NS=sales-pipeline
+  while :; do
+    TS=$(date -u +%s)
+    A=$(kubectl -n $NS get deploy,hpa,pods,endpoints -o json 2>/dev/null)
+    B=$(kubectl get nodes,nodeclaims,nodepools -o json 2>/dev/null)
+    M=$(kubectl get --raw "/apis/metrics.k8s.io/v1beta1/namespaces/$NS/pods" 2>/dev/null)
+    G=$(kubectl get --raw "/apis/metrics.k8s.io/v1beta1/namespaces/monitoring/pods" 2>/dev/null)
+    Q=$(aws sqs get-queue-attributes --queue-url "$QURL" \
+          --attribute-names ApproximateNumberOfMessages \
+                            ApproximateNumberOfMessagesNotVisible 2>/dev/null)
+    # assemble one CSV row (section 7 schema) with jq from $A $B $M $G $Q;
+    # set sample_ok=0 if any of the five is empty
+    sleep 10
+  done >> timeline.csv
+Five calls per tick, about one second of work, so the 10-second cadence holds.
+Use kubectl get --raw against metrics.k8s.io rather than kubectl top, because the
+raw endpoint returns JSON that jq can consume directly.
+
+14.7 DURING AND AFTER THE RUN
+  kubectl -n sales-pipeline get events --sort-by=.lastTimestamp | tail -40
+  kubectl -n sales-pipeline describe hpa api | sed -n '/Conditions/,/Events/p'
+  kubectl -n sales-pipeline describe scaledobject worker
+  kubectl get nodeclaims -o wide
+  kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=200 \
+    | grep -i -e disrupt -e limit -e nodeclaim
+
+  kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:9090 &
+  curl -s 'http://localhost:9090/api/v1/query?query=ALERTS%7Balertstate%3D%22firing%22%7D' \
+    | jq -r '.data.result[].metric|"\(.alertname) \(.severity)"' | sort | uniq -c
+  kubectl -n monitoring port-forward svc/kube-prometheus-stack-alertmanager 9093:9093 &
+  curl -s http://localhost:9093/api/v2/alerts \
+    | jq -r '.[]|"\(.labels.alertname) \(.status.state) \(.startsAt)"'
+
+  aws cloudwatch get-metric-data --start-time <T0> --end-time <T_end> \
+    --metric-data-queries file://rds-queries.json    # 60s period, the 7 metrics in section 7
+
+  kubectl cp monitoring/<loadgen-pod>:/data/gen-requests.ndjson ./gen-requests.ndjson
+
+14.8 TEARDOWN OF THE TEST HARNESS - NOTHING ELSE WILL DO IT
+  kubectl -n monitoring delete deploy loadgen
+  kubectl -n monitoring delete configmap loadgen-script
+  kubectl -n monitoring delete pod psql --ignore-not-found
+ArgoCD prunes only what it tracks (4.3), so these are invisible to prune: true
+and will otherwise sit there indefinitely. The S3 objects the run wrote expire on
+their own after raw_retention_days (variables_data.tf:57-61, default 30); the
+jobs and results rows do not, so decide separately whether to keep them as the
+run's record or delete them by submitted_at.
+
+
+15. FILES THIS PLAN TOUCHES
+
+Creates exactly one file: loadtest-plan.txt at the repository root. Nothing else.
+The load generator, its ConfigMap, and the observer script are specified here and
+built only after this plan has been read and approved. No change is proposed to
+api/main.py, to any manifest, to any Terraform, to any workflow, to smoke.sh, to
+the three test files, to scripts/validate-manifests.sh, or to any markdown file.
+
+That was true of the planning session. The generator was built on 2026-09-13 and
+section 16 lists the files it added. The observer script in section 7 is still
+unbuilt.
+
+
+16. REVISIONS
+
+2026-09-13. The calibration half of this plan was built: Stage 0 (local
+docker-compose) and Stage A plus a short /jobs rate probe. Not the full run.
+Building it replaced several of this plan's [derived] and [estimate] figures
+with measurements, corrected four of them, and changed one stage's shape. The
+corrections are marked [was] where they sit: 3.1b (conntrack timeout and
+method), 3.3 (payload memory), 4.2 (monitoring-node headroom and what to
+request), and section 5 (Stage A's ladder).
+
+FILES ADDED
+  loadtest/loadgen.py                 the generator. Python 3.12 standard
+                                      library only, no third-party packages, so
+                                      nothing is installed at pod start over the
+                                      one shared NAT IP.
+  loadtest/config-calibration.json    the in-cluster stage list. 38.1 min.
+  loadtest/config-local.json          the same script against docker-compose.
+  loadtest/loadgen-deployment.yaml    Deployment, namespace monitoring.
+  loadtest/kustomization.yaml         configMapGenerator, so the ConfigMap is
+                                      built from loadgen.py and cannot drift
+                                      from it. Renders configmap/loadgen-script
+                                      and deploy/loadgen, which are the names
+                                      14.8 tears down.
+  docker-compose.yml                  +19 lines: a loadgen service under
+                                      profiles: ["loadtest"], so plain
+                                      docker compose up is unchanged. It
+                                      bind-mounts loadtest/ and runs the same
+                                      file the cluster runs.
+loadtest/ is outside k8s/overlays/prod, so kustomize build of the overlay is
+byte-identical (26 resources, verified), validate-manifests.sh never sees these
+files, and ArgoCD cannot sync or prune them. None of them carries
+app.kubernetes.io/instance, which is what ArgoCD's default tracking keys on.
+
+WHAT WAS MEASURED, AND HOW
+All of it on a workstation against a local reference target, NOT on this
+cluster. The AWS-side numbers in this plan are untouched and still [derived].
+  - Client cost per fresh-connection request, one CPython core: raw
+    asyncio.Protocol 185 us, asyncio streams 213 us, threads + http.client
+    1,412 us at 2.28 cores. That is why the generator is two asyncio worker
+    processes over raw protocols and not a thread pool, and why one process
+    cannot carry 4,000 req/s.
+  - The shipped generator at the Stage A rung rates, all with zero
+    offered_dropped and zero transport errors:
+        1,000 req/s   delivered   995.2/s    615m steady
+        2,000 req/s   delivered 1,990.5/s    670m steady,   788m peak
+        4,000 req/s   delivered 3,966.2/s    980m steady, 1,373m peak
+        /jobs 100/s at n = 1,000               140m steady
+    Peak RSS 28 + 24 + 24 MiB across parent and two workers.
+  - TIME_WAIT sides at 4,000 conn/s: 14,107 server, 0 client. 3.1b confirmed.
+  - Payload correctness against the repository's real worker/processing.py
+    process_batch: for every (n, reject_frac) tried, all 8 bodies produce
+    identical rows_processed and rows_rejected, matching what the generator
+    predicts and prints at startup. n = 1,000 with no rejections serialises to
+    exactly 85,013 bytes, which is 2.1's arithmetic to the byte.
+
+WHAT THAT SETTLED ABOUT 4.2's POD
+requests == limits, cpu 2, memory 1Gi, ephemeral-storage 1Gi. 4,000 req/s costs
+1,373m at peak, which is 69% of a 2-CPU limit and therefore clear of the 85%
+HOLD rule in Stage B. At 1,500m it would be 92% and the generator would trip its
+own honesty rule at the top rung.
+
+4.2's HEADROOM FIGURE WAS OPTIMISTIC AND IS NOW CORRECTED IN PLACE. 4.2 said
+about 2,495m free on the monitoring node; re-deriving from the repo gives
+2,170m-2,570m. The three wrong terms, the corrected sum, the measured cost of
+the generator at each rung, and an explicit decision rule for what to request
+and what to cap if describe-node reports less than 2,000m free, are all in 4.2
+itself under [was]. Do not size the pod from this section; size it from 4.2.
+
+STILL UNBUILT, STILL AS SPECIFIED
+The section 7 observer (timeline.csv, 10s cadence from the workstation through
+the SSM tunnel) and the run manifest. Stage 0's docker-compose leg has not been
+executed either: the workstation had no running Docker engine when the generator
+was built, so smoke.sh, api/smoke_test.py and worker/integration_test.py have
+not been run against it. worker/test_processing.py was run and passes.
+

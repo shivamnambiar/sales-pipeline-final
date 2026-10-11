@@ -1,0 +1,32 @@
+# Terraform local artifacts (state can contain secrets).
+# .terraform.lock.hcl is NOT ignored: it is to be committed once generated.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+tfplan
+plan.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+
+# Local test artifacts (smoke/integration runs)
+*.db
+plateau_log.csv
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Packaging
+*.zip
+
+# Claude Code personal overrides (never commit - they change permission behavior for everyone)
+.claude/settings.local.json
+CLAUDE.local.md

@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: monitoring
+  labels:
+    app: loadgen
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: loadgen
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      nodeSelector:
+        role: monitoring
+      tolerations:
+        - key: role
+          operator: Equal
+          value: monitoring
+          effect: NoSchedule
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: loadgen
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -u
+            - /opt/loadgen/loadgen.py
+            - --config
+            - /opt/loadgen/config.json
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+          volumeMounts:
+            - name: script
+              mountPath: /opt/loadgen
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: script
+          configMap:
+            name: loadgen-script
+            defaultMode: 0444
+        - name: data
+          emptyDir:
+            sizeLimit: 1Gi

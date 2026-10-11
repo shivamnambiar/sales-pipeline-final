@@ -1,0 +1,752 @@
+FIRST-DEPLOY STEPS - sales-pipeline
+From the repo as it is on 2026-09-29 to the api and worker running on EKS in your AWS account.
+
+Work top to bottom. Tick a box only when its Check line is true. Steps marked DECIDE are
+choices only you can make; each gives the options and the recommended one, and the steps
+after it assume the recommended choice unless they say otherwise. Values in <angle brackets>
+are yours; the step that produces each one names it. <GIT_REPO_URL> is
+https://github.com/shivamnambiar/sales-pipeline-final throughout. "RUNBOOK" is RUNBOOK.md,
+"CICD_SETUP" is .github/CICD_SETUP.md, "TF-README" is terraform/README.md.
+
+=====================================================================================
+STAGE 1 - PREPARE YOUR LAPTOP AND THE REPO (no AWS resources, nothing billed)
+=====================================================================================
+
+[ ] 1.  Install the tools the hands-on steps call: aws CLI, the Session Manager plugin (a
+        separate installer from the CLI), terraform 1.16.1 or newer (CI's pin; an older
+        binary refuses to read the state CI writes), kubectl, kustomize v5.4.3, jq and gh.
+        Optional: kubeconform v0.6.7 (only to run CI's manifest gate locally) and helm (only
+        to recover a failed platform apply).
+        Check: `aws --version`, `session-manager-plugin --version`, `terraform version`
+        (v1.16.1 or newer), `kubectl version --client`, `kustomize version`, `jq --version`
+        and `gh --version` all answer.
+        More: RUNBOOK, "Local workstation setup"; RUNBOOK, "Accessing the private cluster"
+
+[ ] 2.  Log gh in and let it supply git's https credential, so the pushes in later steps and
+        the bootstrap script's dry-run push never prompt.
+          gh auth login
+          gh auth setup-git
+        Check: `gh auth status` succeeds and `git push --dry-run origin main` returns without
+        prompting for a password.
+        More: RUNBOOK, Phase 2 (the prerequisites list)
+
+[ ] 3.  DECIDE: which AWS region. Options: any region that offers EKS 1.36, Postgres 16, the
+        three pinned addon builds and at least two AZs (step 10 checks all four); us-east-1
+        is the example every document uses. Recommended: us-east-1. Keep your choice as
+        <AWS_REGION>.
+        Check: your choice is written here: ____________________
+        More: RUNBOOK, "Where configuration values live"
+
+[ ] 4.  Export the region in every terminal you will use for the rest of this list, the
+        tunnel terminal in step 39 and the kubectl terminal in step 40 included.
+          export AWS_DEFAULT_REGION=<AWS_REGION>
+        Check: `aws configure list` shows region = <AWS_REGION> with source env.
+        More: RUNBOOK, Phase 0 step 3
+
+[ ] 5.  DECIDE: what to do with the uncommitted work in the tree: modified
+        .claude/settings.json, .gitignore, CLAUDE.md, RUNBOOK.md, .github/CICD_SETUP.md,
+        docs/DESIGN.md, docs/terraform-ci-role-README.md, k8s/README.md,
+        loadtest/plateau_test.py, overview.txt and scripts/db-bootstrap.sql, six deleted
+        root-level .txt notes, untracked loadtest/loadtest-plan.txt,
+        first-deploy-checklist.txt and this file, and two edits that must stay OUT of this
+        commit, terraform/README.md and .github/workflows/terraform.yml (they trigger
+        terraform.yml, so they are the first PR, step 30). The bootstrap script's second run
+        (step 50) does `git pull --rebase`, which refuses unstaged changes to tracked files,
+        and step 6 wants everything else clean. Options: commit everything except those two
+        (nothing else is under terraform/, api/, worker/ or app.yml, so no AWS-touching
+        workflow fires), or move the .txt drafts outside the repo and commit the rest.
+        Recommended: commit everything except those two.
+        Check: your choice is written here: ____________________
+        More: RUNBOOK, Phase 2 (the prerequisites list); RUNBOOK, Phase 1
+
+[ ] 6.  Commit and push the cleanup from step 5 so main is clean and level with origin,
+        leaving the two first-PR files in the tree.
+          git add -A -- . ':!terraform/README.md' ':!.github/workflows/terraform.yml'
+          git commit -m "repo: commit pending doc, loadtest, script and settings changes"
+          git push
+        Check: `git status -sb` prints `## main...origin/main` followed only by
+        ` M .github/workflows/terraform.yml` and ` M terraform/README.md`; on GitHub, the
+        k8s-validate run for this push has "shellcheck scripts + settings JSON" green.
+        If its "kustomize build + kubeconform" job is red: expected; it stays red until the
+        push in step 50, because the last tokens are resolved by CI's pin in step 48, that
+        pin push starts no workflow, and step 50's push is the first to run it green.
+        More: RUNBOOK, Phase 1 (the "After Phase 1" paragraph)
+
+[ ] 7.  Run the read-only Terraform loop locally, the same checks CI's plan job runs first.
+          export TF_VAR_region=<AWS_REGION>
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform/platform-stack init -backend=false
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform validate
+          terraform -chdir=terraform/platform-stack validate
+        Check: fmt prints nothing and exits 0; both validates print "Success! The
+        configuration is valid."
+        If fmt lists files: run `terraform -chdir=terraform fmt -recursive` and leave the
+        result uncommitted for the PR branch in step 30 (it is a change under terraform/).
+        More: CLAUDE.md, "Commands"; RUNBOOK, "Local workstation setup"
+
+[ ] 8.  Record the repository IDs the IAM trust policies pin.
+          gh api repos/shivamnambiar/sales-pipeline-final \
+            --jq '{repo_id:.id,owner_id:.owner.id,visibility:.visibility}'
+        Keep repo_id as <REPO_ID> and owner_id as <OWNER_ID>; note visibility for step 28.
+        Check: all three fields print; the two ids are integers (you will paste them inside
+        quotes in step 18).
+        More: RUNBOOK, Phase 0 step 2
+
+=====================================================================================
+STAGE 2 - SET UP AWS AND GITHUB (RUNBOOK Phase 0; still nothing billed)
+=====================================================================================
+
+[ ] 9.  Confirm the AWS identity you are bootstrapping with; work as an administrator in the
+        target account for this whole stage. Record Account as <ACCOUNT_ID> and note whether
+        the Arn is user/<name> or assumed-role/<RoleName>/<session>, which step 25 needs.
+          aws sts get-caller-identity
+        Check: Account is the account you intend to build in.
+        If you see "Unable to locate credentials" or another account: switch the shell to the
+        administrator's profile (`export AWS_PROFILE=<profile>` or `aws sso login`), re-run.
+        More: RUNBOOK, Phase 0 step 5b
+
+[ ] 10. Confirm <AWS_REGION> offers everything the code pins, plus the account's EBS default
+        key, before anything bills.
+          aws eks describe-cluster-versions --cluster-versions 1.36 \
+            --query 'clusterVersions[].{v:clusterVersion,status:versionStatus}'
+          for a in vpc-cni:v1.22.1-eksbuild.2 coredns:v1.14.3-eksbuild.2 kube-proxy:v1.36.0-eksbuild.7; do n=${a%%:*}; v=${a#*:}; echo -n "$n $v -> "; aws eks describe-addon-versions --kubernetes-version 1.36 --addon-name "$n" --query "addons[0].addonVersions[?addonVersion=='$v'].addonVersion" --output text; done
+          aws rds describe-db-engine-versions --engine postgres \
+            --query "DBEngineVersions[?starts_with(EngineVersion,'16')].EngineVersion"
+          aws ec2 describe-availability-zones --query 'AvailabilityZones[?State==`available`].ZoneName'
+          aws ec2 get-ebs-encryption-by-default; aws ec2 get-ebs-default-kms-key-id
+        Check: one entry for 1.36; each of the three addon lines echoes its version back; at
+        least one 16.x Postgres version; at least two zone names; the EBS default key is
+        alias/aws/ebs.
+        If 1.36 is absent: move cluster_version and all three addon pins in
+        terraform/modules/cluster/variables_cluster.tf together to a version the region
+        lists, and leave the edit uncommitted for the first PR (step 30).
+        If one addon line is empty: move that one pin the same way, same PR.
+        If no 16.x Postgres: pick another region (step 3).
+        If the EBS default key is a customer-managed key: reset it before step 35 with
+        `aws ec2 reset-ebs-default-kms-key-id`; neither the Auto Scaling role that launches
+        the two node groups nor Karpenter's controller role has a grant on a custom key.
+        More: RUNBOOK, Phase 0 step 8; TF-README, "Apply-time notes"
+
+[ ] 11. Request the On-Demand vCPU quota now, so the wait overlaps the rest of this stage.
+        The first apply launches 4 x c5.xlarge = 16 On-Demand vCPUs against a new account's
+        default of 5, and the first sync then adds two Karpenter on-demand nodes for the api
+        pods (about 6 more), so 22 is the floor by step 51, and 32 also covers the on-demand
+        NodePool's full limit.
+          aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A \
+            --query Quota.Value --output text
+          aws service-quotas request-service-quota-increase --service-code ec2 \
+            --quota-code L-1216C47A --desired-value 32
+        Check: the first command prints 32 or more, or the request appears with a status in
+        `aws service-quotas list-requested-service-quota-change-history-by-quota
+        --service-code ec2 --quota-code L-1216C47A`. Step 33 waits for it to land.
+        More: RUNBOOK, Phase 0 step 8
+
+[ ] 12. Create the EC2 Spot service-linked role (idempotent; an account that has never run
+        Spot lacks it, and without it the worker's Spot nodes never launch).
+          aws iam create-service-linked-role --aws-service-name spot.amazonaws.com || true
+        Check: `aws iam get-role --role-name AWSServiceRoleForEC2Spot` succeeds.
+        More: RUNBOOK, Phase 0 step 7
+
+[ ] 13. Create the Terraform state bucket in <AWS_REGION>, versioned, with default SSE-S3
+        encryption; pick a globally unique name, <STATE_BUCKET>. Do not set a customer KMS
+        key on it (the in-VPC CodeBuild role has no KMS grant) and create no DynamoDB table
+        (locking is the S3 lockfile).
+          aws s3 mb s3://<STATE_BUCKET> --region <AWS_REGION>
+          aws s3api put-bucket-versioning --bucket <STATE_BUCKET> \
+            --versioning-configuration Status=Enabled
+        Check: `aws s3api get-bucket-location --bucket <STATE_BUCKET>` prints <AWS_REGION>
+        (or null for us-east-1); `aws s3api get-bucket-versioning --bucket <STATE_BUCKET>`
+        prints Enabled; `aws s3api get-bucket-encryption --bucket <STATE_BUCKET>` shows
+        AES256 with no KMSMasterKeyID.
+        More: TF-README, "Before you start: create the state bucket"; RUNBOOK, Phase 0 step 1
+
+[ ] 14. Create the Grafana admin secret in Secrets Manager, in <AWS_REGION>, as a plain
+        string with no --kms-key-id (not the console's key/value form). The name and the
+        region are a contract with the CodeBuild project, which resolves it at build start.
+          aws secretsmanager create-secret --name sales-pipeline/grafana-admin \
+            --region "$AWS_DEFAULT_REGION" --secret-string '<GRAFANA_PASSWORD>'
+        Check: `aws secretsmanager describe-secret --secret-id sales-pipeline/grafana-admin
+        --query '{arn:ARN,kms:KmsKeyId}'` shows an ARN in <AWS_REGION> and kms null, and
+        `aws secretsmanager get-secret-value --secret-id sales-pipeline/grafana-admin
+        --query SecretString --output text | head -c1` is not `{`.
+        More: RUNBOOK, Phase 0 step 5c; CICD_SETUP, "Platform stack runs in CodeBuild"
+
+[ ] 15. DECIDE: how to create the GitHub OIDC provider in IAM. Options: the IAM console
+        (Identity providers -> Add provider -> OpenID Connect, URL
+        https://token.actions.githubusercontent.com, audience sts.amazonaws.com; the console
+        fetches the certificate thumbprint itself), or the CLI, where you must supply a
+        thumbprint value yourself. Recommended: the console.
+        Check: your choice is written here: ____________________
+        More: RUNBOOK, Phase 0 step 2; CICD_SETUP, "The OIDC roles"
+
+[ ] 16. Create the OIDC provider as decided in step 15. Its ARN must be exactly
+        arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com, which
+        is what both trust files name as the Federated principal.
+        Check:
+          aws iam get-open-id-connect-provider --open-id-connect-provider-arn \
+            arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com \
+            --query ClientIDList
+        prints ["sts.amazonaws.com"].
+        More: CICD_SETUP, "The OIDC roles"
+
+[ ] 17. DECIDE: where the filled-in IAM JSON files live. The trust files need your account ID
+        and repository IDs; the Terraform policy needs the bucket name. Options: fill copies
+        outside the repo (the account ID never enters git, consistent with the operator ARN
+        being a GitHub secret for that reason), or fill the tracked files under docs/ and
+        commit them. Recommended: copies outside the repo, in ~/sales-pipeline-deploy.
+        Check: your choice is written here: ____________________
+        More: RUNBOOK, "Where configuration values live"; RUNBOOK, Phase 0 step 2
+
+[ ] 18. Copy the four JSON files out and fill every placeholder; the IDs stay inside the
+        quotes they already sit in. Keep the four conditions exactly as shipped (aud,
+        repository_id, both sub forms, job_workflow_ref) and add no branch or environment
+        condition, which would break PR plans without separating the two roles.
+          mkdir -p ~/sales-pipeline-deploy
+          cp docs/terraform-ci-role-trust.json docs/app-ci-role-trust.json \
+             docs/terraform-ci-role-policy.json docs/app-ci-role-policy.json ~/sales-pipeline-deploy/
+          cd ~/sales-pipeline-deploy
+          sed -i -e 's/ACCOUNT_ID/<ACCOUNT_ID>/g' -e 's/OWNER_ID/<OWNER_ID>/g' \
+                 -e 's/REPO_ID/<REPO_ID>/g' terraform-ci-role-trust.json app-ci-role-trust.json
+          sed -i 's/REPLACE_TF_STATE_BUCKET/<STATE_BUCKET>/g' terraform-ci-role-policy.json
+          cd -
+        Check: `grep -nE 'ACCOUNT_ID|OWNER_ID|REPO_ID|REPLACE_' ~/sales-pipeline-deploy/*.json`
+        prints nothing, and `jq empty ~/sales-pipeline-deploy/*.json` exits 0.
+        More: RUNBOOK, Phase 0 step 2; CICD_SETUP, "The OIDC roles"
+
+[ ] 19. DECIDE: how to prove the trust conditions match this repo's tokens, since no document
+        settles whether job_workflow_ref also carries @ID suffixes under GitHub's immutable
+        subject format. Options: (a) do step 20 now, on a throwaway branch, and decode a
+        token before creating the roles, or (b) create the roles from the filled files and
+        let the first PR plan (step 30) be the test, since a mismatch fails closed and costs
+        only a trust-policy edit. Recommended: (b); do step 20 only if step 30 fails on the
+        assume.
+        Check: your choice is written here: ____________________
+        More: CICD_SETUP, "The OIDC roles"
+
+[ ] 20. Only if step 19 chose (a), or if step 30 later fails on the assume: push the OIDC
+        probe on a throwaway branch, read the token claims from its job log under Actions,
+        then delete the branch.
+          (on a branch, add .github/workflows/oidc-probe.yml:)
+            on: push
+            permissions: { id-token: write, contents: read }
+            jobs:
+              probe:
+                runs-on: ubuntu-latest
+                steps:
+                  - run: |
+                      curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{sub,job_workflow_ref,repository_id,repository_owner_id}'
+          git switch -c oidc-probe && git add .github/workflows/oidc-probe.yml \
+            && git commit -m "oidc probe" && git push -u origin oidc-probe
+          (read the job log under Actions, then:)
+          git switch main && git branch -D oidc-probe && git push origin --delete oidc-probe
+        Check: the log's repository_id equals <REPO_ID>, sub starts with one of the two forms
+        in the trust file, job_workflow_ref matches the filled trust copies (edited as below
+        if needed), and `git branch -a | grep oidc-probe` prints nothing.
+        If the owner/repo part of job_workflow_ref carries @IDs: change that value in both
+        filled trust copies to
+        shivamnambiar@<OWNER_ID>/sales-pipeline-final@<REPO_ID>/.github/workflows/<file>@*.
+        If the roles already exist (steps 21 and 23 done): apply the edited copies with the
+        `aws iam update-assume-role-policy` commands in step 30's failure note.
+        More: CICD_SETUP, "The OIDC roles"
+
+[ ] 21. Create the Terraform CI role from the filled files, with a two-hour maximum session:
+        the `apply` job requests `role-duration-seconds: 7200` and the assume fails if the
+        role's maximum is lower. <TF_ROLE_ARN> is
+        arn:aws:iam::<ACCOUNT_ID>:role/sales-pipeline-terraform-ci.
+          aws iam create-role --role-name sales-pipeline-terraform-ci \
+            --assume-role-policy-document file://$HOME/sales-pipeline-deploy/terraform-ci-role-trust.json \
+            --max-session-duration 7200
+          aws iam put-role-policy --role-name sales-pipeline-terraform-ci --policy-name terraform-ci \
+            --policy-document file://$HOME/sales-pipeline-deploy/terraform-ci-role-policy.json
+        Check: `aws iam get-role --role-name sales-pipeline-terraform-ci --query
+        'Role.[Arn,MaxSessionDuration]'` prints the ARN and 7200, and
+        `aws iam get-role-policy --role-name sales-pipeline-terraform-ci --policy-name
+        terraform-ci --query 'PolicyDocument.Statement[0].Resource'` names <STATE_BUCKET>.
+        More: RUNBOOK, Phase 0 step 2; docs/terraform-ci-role-README.md, "Known caveats"
+
+[ ] 22. DECIDE: create the App CI role now or after the first PR plan. RUNBOOK Phase 0 step 2
+        and CICD_SETUP say one role, one PR plan, then the other, which protects a role
+        already in use; neither role is in use yet, and nothing reads the app role's ARN
+        before the build in step 45. Options: create it now (if step 30 shows the trust
+        format is wrong you correct both roles with the same edit), or wait, skipping step
+        23 and step 26's AWS_APP_ROLE_ARN line, and do both in step 31 once step 30 has
+        proved the format. Recommended: now.
+        Check: your choice is written here: ____________________
+        More: RUNBOOK, Phase 0 step 2; CICD_SETUP, "The OIDC roles"
+
+[ ] 23. Create the App CI role from the filled trust file and the unchanged policy file.
+        <APP_ROLE_ARN> is arn:aws:iam::<ACCOUNT_ID>:role/sales-pipeline-app-ci.
+          aws iam create-role --role-name sales-pipeline-app-ci \
+            --assume-role-policy-document file://$HOME/sales-pipeline-deploy/app-ci-role-trust.json
+          aws iam put-role-policy --role-name sales-pipeline-app-ci --policy-name app-ci \
+            --policy-document file://$HOME/sales-pipeline-deploy/app-ci-role-policy.json
+        Check: `aws iam get-role --role-name sales-pipeline-app-ci --query
+        'Role.AssumeRolePolicyDocument.Statement[0].Condition.StringLike'` shows
+        job_workflow_ref ending in /.github/workflows/app.yml@*.
+        More: RUNBOOK, Phase 0 step 2; docs/app-ci-role-README.md, "What each statement is for"
+
+[ ] 24. DECIDE: which IAM principal you personally use for the tunnel, kubectl,
+        db-bootstrap.sh and bootstrap-overlay.sh. Options: an account administrator (every
+        permission the scripts need, including reading the state bucket in step 42, comes
+        with it), or a scoped role, which then needs rds:DescribeDBInstances,
+        secretsmanager:GetSecretValue on the RDS master secret, kms:Decrypt on
+        alias/sales-pipeline, ssm:StartSession, ec2:DescribeInstances, eks:DescribeCluster,
+        and s3:GetObject plus s3:ListBucket on <STATE_BUCKET>. Never the CI role: it already
+        gets an admin access entry as cluster creator and a duplicate entry fails the apply.
+        Recommended: the administrator, for the first run.
+        Check: your choice is written here: ____________________
+        More: RUNBOOK, Phase 0 step 5b
+
+[ ] 25. Record that principal's IAM ARN as <OPERATOR_ARN> and prove its permissions. Use the
+        arn:aws:iam:: form, never the arn:aws:sts:: session form from step 9.
+        For an IAM user:
+          aws iam get-user --query User.Arn --output text
+        For a role (step 9 showed assumed-role/<RoleName>/...):
+          aws iam get-role --role-name <RoleName> --query Role.Arn --output text
+        Then:
+          aws iam simulate-principal-policy --policy-source-arn <OPERATOR_ARN> \
+            --action-names rds:DescribeDBInstances secretsmanager:GetSecretValue kms:Decrypt \
+            ssm:StartSession ec2:DescribeInstances eks:DescribeCluster s3:GetObject s3:ListBucket \
+            --resource-arns '*' --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table
+        Check: every row says allowed, and <OPERATOR_ARN> starts with arn:aws:iam::.
+        More: RUNBOOK, Phase 0 step 5b
+
+[ ] 26. Set the five GitHub secrets and the one variable, from the repo root. <ALERT_EMAIL>
+        is a mailbox you can click a confirmation link from; the Grafana password is not a
+        GitHub secret.
+          gh secret set AWS_TF_ROLE_ARN --body "<TF_ROLE_ARN>"
+          gh secret set AWS_APP_ROLE_ARN --body "<APP_ROLE_ARN>"
+          gh secret set TF_BACKEND_BUCKET --body "<STATE_BUCKET>"
+          gh secret set TF_VAR_OPERATOR_PRINCIPAL_ARN --body "<OPERATOR_ARN>"
+          gh secret set SCAN_ALERT_EMAIL --body "<ALERT_EMAIL>"
+          gh variable set AWS_REGION --body "<AWS_REGION>"
+        Check: `gh secret list` shows exactly those five names (four, without
+        AWS_APP_ROLE_ARN, if you chose to wait in step 22; it arrives in step 31);
+        `gh variable list` shows AWS_REGION with <AWS_REGION>.
+        More: CICD_SETUP, "What you must configure in GitHub"; RUNBOOK, Phase 0 step 3
+
+[ ] 27. Create the `production` environment with yourself as a required reviewer: on GitHub,
+        the repo -> Settings -> Environments -> New environment -> name exactly `production`
+        -> tick Required reviewers -> add yourself -> Save protection rules. The infra and
+        platform apply jobs run `terraform apply -auto-approve` under this environment and
+        the app deploy job runs under it too; with no reviewer nothing gates any of them.
+        Check:
+          gh api repos/shivamnambiar/sales-pipeline-final/environments/production \
+            --jq '[.protection_rules[].type]'
+        contains "required_reviewers".
+        If the Required reviewers checkbox is not offered: the repo is private on a plan
+        without it; decide in step 28 before going further.
+        More: CICD_SETUP, "Environment"; RUNBOOK, Phase 0 step 4
+
+[ ] 28. DECIDE: repository visibility and the approval gate. GitHub offers required
+        reviewers on public repositories on every plan and on private ones only on
+        Enterprise. If step 27 worked, keep the repo as it is and move on. If it did not,
+        the options are: make the repo public (Settings -> General -> Danger Zone -> Change
+        visibility, then redo step 27), or stay private and merge to main with no approval
+        on the infra, platform or app deploys. Recommended: make it public; nothing in the
+        tree is a credential (state and plan files are gitignored, there is no tfvars file
+        and you should not create one, the filled JSONs stay outside), and public also
+        removes the ArgoCD credential in step 49.
+        Check: your choice is written here: ____________________ and step 27's check passes
+        (or you have accepted an ungated first merge).
+        More: RUNBOOK, Phase 0 step 4; RUNBOOK, Phase 2 ("REQUIRED for private repos")
+
+[ ] 29. Confirm main has no branch protection and no ruleset, and leave it that way. The
+        deploy job pushes the image-tag pin to main with GITHUB_TOKEN; a require-PRs rule
+        would reject that push and every deploy would die there.
+          gh api repos/shivamnambiar/sales-pipeline-final/rulesets
+          gh api repos/shivamnambiar/sales-pipeline-final/branches/main/protection
+        Check: the first prints []; the second fails with 404 "Branch not protected".
+        More: CICD_SETUP, "Operational gotchas"; docs/DESIGN.md, "Deliberately unfinished or
+        deliberately deferred"
+
+=====================================================================================
+STAGE 3 - BUILD THE INFRASTRUCTURE (RUNBOOK Phase 1; billing starts at step 35)
+=====================================================================================
+
+[ ] 30. Open the first PR from the two edits left in the tree in step 6, terraform/README.md
+        and .github/workflows/terraform.yml, plus the fmt result from step 7 or the pin move
+        from step 10 if either was needed. This is the first real test of the OIDC trust
+        (steps 16-21) and of the bucket (step 13).
+          git switch -c first-apply
+          git add terraform .github/workflows/terraform.yml && git commit -m "infra: first-apply preparation"
+          git push -u origin first-apply
+          gh pr create --fill
+        Check: `gh pr checks --watch` ends with "validate & plan", "platform validate & plan
+        (PR, CodeBuild)" and "shellcheck scripts + settings JSON" green and only "kustomize
+        build + kubeconform" red (unresolved tokens until step 48), and the PR carries a
+        "Terraform Plan" comment for platform-stack that says "The platform plan could not
+        run".
+        If you see "Could not assume role with OIDC: Not authorized to perform
+        sts:AssumeRoleWithWebIdentity": a trust condition does not match the token; do step
+        20, then `aws iam update-assume-role-policy --role-name sales-pipeline-terraform-ci
+        --policy-document file://$HOME/sales-pipeline-deploy/terraform-ci-role-trust.json`
+        (and the same for sales-pipeline-app-ci if step 23 ran), then "Re-run failed jobs".
+        If you see PermanentRedirect (301) at terraform init: the bucket is not in
+        <AWS_REGION>; recreate it there (step 13).
+        If you see the "terraform fmt" step fail: `terraform -chdir=terraform fmt -recursive
+        && git add terraform && git commit -m "infra: terraform fmt" && git push`.
+        More: RUNBOOK, Phase 1 ("The workflow runs"); CICD_SETUP, "The OIDC roles"
+
+[ ] 31. Only if you chose to wait in step 22: do step 23 now, then set its secret.
+          gh secret set AWS_APP_ROLE_ARN --body "<APP_ROLE_ARN>"
+        Check: `gh secret list` shows AWS_APP_ROLE_ARN.
+        More: RUNBOOK, Phase 0 step 2; CICD_SETUP, "The OIDC roles"
+
+[ ] 32. Read the infra plan before merging: on the PR, read the "Terraform Plan" comment for
+        terraform, then download the tfplan-terraform-<sha> artifact from the run and read
+        plan.txt end to end. Expect the VPC and its NAT gateway, EKS with two managed node
+        groups, RDS Multi-AZ, SQS plus its DLQ, the raw bucket, two ECR repositories, the KMS
+        key, two CodeBuild projects, the IRSA roles and the SNS topic.
+        Check: plan.txt contains a line `Plan: N to add, 0 to change, 0 to destroy.` (the
+        line the PR comment shows; a "Changes to Outputs:" block follows it) and nothing in
+        it is a resource you did not expect.
+        More: RUNBOOK, Phase 1 step 6; TF-README, "Module build order"
+
+[ ] 33. Confirm the quota increase from step 11 has landed. Do not merge below 16: the infra
+        apply launches exactly 16 On-Demand vCPUs.
+          aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A \
+            --query Quota.Value --output text
+        Check: 32 or more.
+        If it prints 16: the apply fits, but the four managed nodes then use all 16 and
+        Karpenter cannot add the api nodes in step 51; you may merge, but re-run this command
+        before step 50 and wait until it prints at least 22.
+        More: RUNBOOK, Phase 0 step 8
+
+[ ] 34. Merge the PR. The run for the merge re-plans, then its `apply` job waits at the
+        production gate; nothing is applied and nothing is billed yet.
+          gh pr merge first-apply --squash --delete-branch
+          gh run list --workflow terraform.yml --branch main --limit 1 --json databaseId,headSha,status
+        <TF_RUN_ID> is the databaseId printed for the run whose headSha is the merge commit.
+        Check: status is "waiting" once the plan job has finished.
+        If headSha is not `git rev-parse origin/main` (run `git fetch` first) or the list is
+        empty: wait a few seconds and repeat the `gh run list` command (the merge's run is
+        created after the push lands, and main holds older completed runs until then).
+        More: RUNBOOK, Phase 1 step 6
+
+[ ] 35. Approve the infra apply at the production gate: Actions -> run <TF_RUN_ID> -> "Review
+        deployments" -> tick production -> "Approve and deploy"; without a reviewer (step 28)
+        the apply started on the merge, so go straight to the Check. Billing starts when you
+        click; the EKS control plane, the Multi-AZ RDS and the NAT gateway are always on from
+        here.
+        Check: the `apply` job ends green.
+        If you see AsgInstanceLaunchFailures / VcpuLimitExceeded on aws_eks_node_group: the
+        quota (step 33); wait for it, then "Re-run failed jobs" and approve it at the gate
+        again (state was saved).
+        If you see AccessDenied on an iam: action: add that action to the Terraform role's
+        policy (edit the copy, `aws iam put-role-policy` again), then "Re-run failed jobs" and
+        approve it at the gate again.
+        If you see ExpiredToken late in the apply: the two-hour credential ran out, every
+        resource still being created is now outside state (RDS and EKS build in parallel, so
+        check both) and the lock was left behind; delete the lock (`aws s3api delete-object
+        --bucket <STATE_BUCKET> --key terraform.tfstate.tflock`, never terraform.tfstate
+        itself), delete each orphan by hand (RDS: `aws rds delete-db-instance
+        --db-instance-identifier sales-pipeline-db --skip-final-snapshot`; EKS: `aws eks
+        delete-nodegroup` for any node group, then `aws eks delete-cluster --name
+        sales-pipeline`) and wait until describe returns NotFound, then do NOT re-run (a
+        re-run uses the failed run's workflow file): `aws iam update-role --role-name
+        sales-pipeline-terraform-ci --max-session-duration 14400`, change
+        role-duration-seconds to 14400 in .github/workflows/terraform.yml on a new PR (steps
+        30, 34), and approve that run's apply; its <TF_RUN_ID> replaces this one below.
+        More: RUNBOOK, "First-apply watch list"; docs/terraform-ci-role-README.md, "Known
+        caveats"; RUNBOOK, "Cost note"
+
+[ ] 36. Verify the infra stack from your laptop.
+          aws eks describe-cluster --name sales-pipeline \
+            --query 'cluster.{status:status,public:resourcesVpcConfig.endpointPublicAccess}'
+          aws ecr describe-repositories --query 'repositories[].repositoryName'
+          aws rds describe-db-instances --db-instance-identifier sales-pipeline-db \
+            --query 'DBInstances[0].[DBInstanceStatus,MultiAZ]'
+          aws codebuild batch-get-projects --names sales-pipeline-platform sales-pipeline-argocd-refresh \
+            --query 'projects[].name'
+          aws ec2 describe-instances --filters "Name=tag:eks:cluster-name,Values=sales-pipeline" \
+            "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].InstanceId'
+        Check: ACTIVE and false; sales-pipeline-api and sales-pipeline-worker; available and
+        true; both project names; four instance IDs.
+        More: RUNBOOK, Phase 1 step 6
+
+[ ] 37. Confirm the SNS email subscription: open the "AWS Notification - Subscription
+        Confirmation" email at <ALERT_EMAIL> for sales-pipeline-image-scan-alerts and click
+        Confirm subscription. Unconfirmed, it is the same as no alerting at all.
+          aws sns list-subscriptions-by-topic --topic-arn "$(aws sns list-topics \
+            --query "Topics[?contains(TopicArn,'sales-pipeline-image-scan-alerts')].TopicArn|[0]" \
+            --output text)" --query 'Subscriptions[].SubscriptionArn'
+        Check: a real subscription ARN, not "PendingConfirmation".
+        More: RUNBOOK, Phase 0 step 6
+
+[ ] 38. Approve the platform apply: `platform-plan` starts by itself after `apply` and runs
+        inside the sales-pipeline-platform CodeBuild project, and when it is green
+        `platform-apply` waits at the same gate (Actions -> run <TF_RUN_ID> -> "Review
+        deployments" -> approve). It installs the eight Helm releases and can take up to
+        CodeBuild's 45-minute limit.
+        Check: `platform-apply` ends green, and the tfplan-platform-<sha> artifact's plan.txt
+        contains a `Plan: N to add, 0 to change, 0 to destroy.` line (the file is the
+        CodeBuild log, so it ends with phase lines, not that one).
+        If you see "Decrypted Variables Error" in the CodeBuild PROVISIONING phase: the
+        Grafana secret is missing or in another region (step 14).
+        If the apply stalls about five minutes then fails on
+        helm_release.kube_prometheus_stack: after step 40, `kubectl -n monitoring get jobs |
+        grep admission` and read the FailedScheduling events before re-running (it waits at
+        the gate again).
+        If the build is killed at 45 minutes: after step 40, `helm list -A -a`, `helm
+        uninstall <release> -n <ns>` for any pending-install release, delete only the lock
+        (`aws s3api delete-object --bucket <STATE_BUCKET> --key platform.tfstate.tflock`,
+        never platform.tfstate itself), then "Re-run failed jobs" and approve it at the gate
+        again.
+        More: RUNBOOK, "First-apply watch list"; CICD_SETUP, "Platform stack runs in CodeBuild"
+
+=====================================================================================
+STAGE 4 - REACH THE PRIVATE CLUSTER AND CREATE THE DATABASE USERS
+=====================================================================================
+
+[ ] 39. Open the SSM port-forward tunnel in its own terminal and leave it running through
+        step 54. The EKS endpoint has no public access at all.
+          NODE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:eks:cluster-name,Values=sales-pipeline" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          EKS_HOST=$(aws eks describe-cluster --name sales-pipeline \
+            --query 'cluster.endpoint' --output text | sed 's|https://||')
+          aws ssm start-session --target "$NODE_ID" \
+            --document-name AWS-StartPortForwardingSessionToRemoteHost \
+            --parameters "host=$EKS_HOST,portNumber=443,localPortNumber=8443"
+        Check: the session prints "Waiting for connections..." and stays open.
+        If you see "SessionManagerPlugin is not found": install the plugin (step 1).
+        More: RUNBOOK, "Accessing the private cluster"
+
+[ ] 40. In a second terminal, point kubeconfig at the tunnel and confirm the platform is up.
+          EKS_HOST=$(aws eks describe-cluster --name sales-pipeline \
+            --query 'cluster.endpoint' --output text | sed 's|https://||')
+          aws eks update-kubeconfig --name sales-pipeline
+          kubectl config set-cluster "arn:aws:eks:<AWS_REGION>:<ACCOUNT_ID>:cluster/sales-pipeline" \
+            --server=https://localhost:8443 --tls-server-name="$EKS_HOST"
+          kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints[*].key
+          kubectl get crd scaledobjects.keda.sh triggerauthentications.keda.sh \
+            podmonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com \
+            opentelemetrycollectors.opentelemetry.io instrumentations.opentelemetry.io \
+            nodepools.karpenter.sh ec2nodeclasses.karpenter.k8s.aws applications.argoproj.io
+          kubectl get ns argocd monitoring opentelemetry keda
+        Check: four nodes, every one with a `role` taint; all nine CRDs listed; all four
+        namespaces Active.
+        If you see "Unauthorized": your principal has no access entry, so
+        TF_VAR_OPERATOR_PRINCIPAL_ARN was empty or wrong at apply time; fix the secret (step
+        26), then Actions -> run <TF_RUN_ID> -> "Re-run all jobs" and approve the apply.
+        More: RUNBOOK, "Accessing the private cluster"; RUNBOOK, Phase 0 step 5b
+
+[ ] 41. Create the IAM database users, once: from the repo root, tunnel up, region exported,
+        as the principal from step 24. The script reads the RDS endpoint and the master
+        secret itself, runs scripts/db-bootstrap.sql from a postgres:16 pod on the bootstrap
+        node group, then verifies the grants.
+          bash scripts/db-bootstrap.sh
+        Check: exits 0 and prints both roles (app_api, app_worker), api_can_create = t, and
+        pg_default_acl rows for app_api granting app_worker on tables and sequences.
+        If you see AccessDeniedException naming kms:Decrypt: the principal lacks decrypt on
+        alias/sales-pipeline (step 24).
+        If the pod never reaches Running within five minutes: `kubectl -n default get events
+        --sort-by=.lastTimestamp | tail`, then re-run (a slow first postgres:16 pull through
+        the NAT is the usual cause).
+        If you see 'role "app_api" already exists': this is a re-run; apply the statements
+        after that one by hand, then `bash scripts/db-bootstrap.sh --verify-only`.
+        More: RUNBOOK, Phase 1.5
+
+=====================================================================================
+STAGE 5 - DEPLOY THE APP (RUNBOOK Phases 2 and 3)
+=====================================================================================
+
+[ ] 42. Run the backend-configured `terraform init` in ./terraform on your laptop, once, as
+        the principal from step 24, so `terraform output` works for the bootstrap script.
+        Never run plan or apply locally; CI is the only applier.
+          terraform -chdir=terraform init \
+            -backend-config="bucket=<STATE_BUCKET>" -backend-config="key=terraform.tfstate" \
+            -backend-config="region=<AWS_REGION>" -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          terraform -chdir=terraform output -json | jq -r \
+            '[.region,.sqs_queue_url,.raw_bucket_name,.cluster_name,.karpenter_node_iam_role_name,.api_role_arn,.worker_role_arn,.rds_endpoint,.db_name][].value'
+        Check: nine non-empty lines with no spaces in them.
+        If init says the backend configuration changed: add `-reconfigure` to the same
+        command.
+        If you see "state snapshot was created by Terraform v1.16.1, which is newer than
+        current": install terraform 1.16.1 or newer (step 1) and re-run the same command.
+        More: RUNBOOK, Phase 2 (the prerequisites list); TF-README, "Before you start:
+        create the state bucket"; TF-README, "Apply order"
+
+[ ] 43. DECIDE: the Trivy policy for the first build. The build job fails on any CRITICAL or
+        HIGH finding that has a fix. Options: keep it and fix what it names (an OS package
+        -> the Dockerfile line in step 44; a Python package -> bump its pin in
+        api/api_requirements.txt or worker/worker_requirements.txt), or lower `severity` to
+        CRITICAL in .github/workflows/app.yml for the first deploy and restore it after.
+        Recommended: keep it and fix what it names.
+        Check: your choice is written here: ____________________
+        More: CICD_SETUP, "Notes / things to know"
+
+[ ] 44. DECIDE: what the first app commit changes. app.yml builds and pushes images only on
+        a push to main that touches api/**, worker/** or app.yml, so a commit is needed and
+        it must change one of those. Options: a change you already want in the app, or one
+        line added to both api/Dockerfile.api and worker/Dockerfile.worker right after the
+        FROM line, which patches fixed OS CVEs (the usual Trivy finding):
+          RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/*
+        Recommended: the Dockerfile line, in both files.
+        Check: your choice is written here: ____________________
+        More: RUNBOOK, Phase 3
+
+[ ] 45. Push the app commit to main and let the run build and push both images; leave its
+        deploy job WAITING at the production gate and do not approve it yet, because it
+        would run the manifest gate against the unresolved infra tokens and fail.
+          git switch main && git pull
+          (make the change from step 44)
+          git add api worker && git commit -m "app: patch OS packages in both images" && git push
+          gh run list --workflow app.yml --branch main --limit 1 --json databaseId,headSha,status
+        <APP_SHA> is the headSha printed and <APP_RUN_ID> is the databaseId.
+        Check: `aws ecr describe-images --repository-name sales-pipeline-api --image-ids
+        imageTag=<APP_SHA>` succeeds, and the same for sales-pipeline-worker; `gh run view
+        <APP_RUN_ID>` shows "build, scan, push" succeeded for both services and "deploy to
+        EKS" waiting.
+        If headSha is not `git rev-parse HEAD` or the list is empty: wait a few seconds and
+        repeat the `gh run list` command (the new run is created after the push lands).
+        If "deploy to EKS" ran at once and failed at "Validate manifests with the pin
+        applied": expected without a reviewer (step 28); the images are in ECR either way.
+        If you see the Trivy step exit 1: step 43.
+        If you see "Not authorized to perform sts:AssumeRoleWithWebIdentity" in the build
+        job: the app role's trust (step 23); fix it with `aws iam update-assume-role-policy
+        --role-name sales-pipeline-app-ci --policy-document
+        file://$HOME/sales-pipeline-deploy/app-ci-role-trust.json`, then "Re-run failed jobs".
+        More: RUNBOOK, Phase 3; CICD_SETUP, "Environment"
+
+[ ] 46. Run the overlay bootstrap for the first time: from the repo root, on main, tunnel up,
+        region exported. It substitutes the nine Terraform outputs and the repo URL into the
+        two files, and then its gate refuses the render because the two image tokens are
+        still unresolved, which is the expected end of this run.
+          git pull
+          bash scripts/bootstrap-overlay.sh https://github.com/shivamnambiar/sales-pipeline-final
+        Check: the last lines are "GATE ERROR: unresolved token(s) in the rendered overlay:
+        REPLACE_ECR_API_REPO REPLACE_ECR_WORKER_REPO REPLACE_SHA" and the script's note that
+        nothing was committed or pushed; `git status --porcelain` shows
+        k8s/overlays/prod/kustomization.yaml and k8s/argocd/application.yaml modified (plus
+        this file, if you tick boxes in it).
+        If it stopped earlier, in a preflight: the tree is untouched; fix what it names and
+        re-run.
+        More: RUNBOOK, Phase 3 (ORDERING, i); RUNBOOK, Phase 2 step 7
+
+[ ] 47. Commit and push exactly those two files.
+          git add k8s/overlays/prod/kustomization.yaml k8s/argocd/application.yaml
+          git commit -m "bootstrap: resolve overlay values from terraform outputs"
+          git push
+        Check: `git log --oneline origin/main..HEAD` prints nothing.
+        If the k8s-validate run for this push is red: expected; the image tokens are pinned
+        in step 48.
+        More: RUNBOOK, Phase 3 (ORDERING, ii)
+
+[ ] 48. Release the deploy job so CI pins the image tags. With a reviewer: Actions -> run
+        <APP_RUN_ID> -> "Review deployments" -> approve "deploy to EKS"; without one:
+          gh run rerun <APP_RUN_ID> --failed
+        Then wait for the job to finish (a few minutes) and pull its pin commit:
+          gh run watch <APP_RUN_ID>
+          git pull && git log -1 --format=%s origin/main
+          kustomize build k8s/overlays/prod | grep -c REPLACE_
+        Check: `gh run view <APP_RUN_ID>` shows "deploy to EKS" green, the subject line is
+        `deploy: pin images to <APP_SHA>` and the count is 0 (the overlay file itself still
+        says REPLACE_ECR_*_REPO under images[].name; only the render must be clean).
+        If the subject line is still "bootstrap: resolve overlay values from terraform
+        outputs": the job has not pushed the pin yet; wait for it to end green and repeat the
+        `git pull`.
+        If the job's "Force immediate ArgoCD refresh" step fails with a ::warning: expected;
+        the Application does not exist yet, and the job is still green.
+        If the newest k8s-validate run on main is still red: expected; CI's pin push starts
+        no workflow, and step 50's push is the first to run it green.
+        More: RUNBOOK, Phase 3 (ORDERING, iii); CICD_SETUP, "Notes / things to know"
+
+[ ] 49. Only if the repo is private (step 28): give ArgoCD a read credential for
+        <GIT_REPO_URL>, or the sync in step 51 sits in a repo-access ComparisonError.
+        <GITHUB_TOKEN> is a fine-grained personal access token with Contents: Read-only on
+        this repository; skip this step for a public repo.
+          kubectl -n argocd create secret generic repo-sales-pipeline \
+            --from-literal=type=git \
+            --from-literal=url=https://github.com/shivamnambiar/sales-pipeline-final \
+            --from-literal=username=shivamnambiar --from-literal=password=<GITHUB_TOKEN>
+          kubectl -n argocd label secret repo-sales-pipeline argocd.argoproj.io/secret-type=repository
+        Check: `kubectl -n argocd get secret -l argocd.argoproj.io/secret-type=repository`
+        lists repo-sales-pipeline.
+        More: RUNBOOK, Phase 2 ("REQUIRED for private repos")
+
+[ ] 50. Commit your ticks in this file, then run the overlay bootstrap a second time. Nothing
+        is left to substitute, so the gate and the server-side dry-run pass, the script's
+        push carries your tick commit (that push fires only k8s-validate, green for the first
+        time on main), and it applies the ArgoCD Application, after which there is no
+        Git-reversible undo of the Application itself.
+          git add first-deploy-steps.txt && git commit -m "checklist: progress through step 49"
+          (skip that line if this file lives outside the repo; the script's push then prints
+          "Everything up-to-date", no workflow runs, and k8s-validate on main stays red until
+          your next push or PR)
+          git pull
+          bash scripts/bootstrap-overlay.sh https://github.com/shivamnambiar/sales-pipeline-final
+        Check: it ends with "Bootstrap complete. ArgoCD is now syncing k8s/overlays/prod from
+        Git." and `git status -sb` prints `## main...origin/main` with nothing under it.
+        If you see "cannot pull with rebase: You have unstaged changes" on a re-run: commit
+        (or stash) whatever changed since, then re-run.
+        More: RUNBOOK, Phase 3 (ORDERING, iv); RUNBOOK, Phase 2 (the four failure states)
+
+[ ] 51. Watch the first sync land. Allow a few minutes: the Application retries with backoff,
+        and the api pods stay Pending until Karpenter launches the first on-demand nodes (one
+        per zone, since the api spreads across both).
+          kubectl -n argocd get application sales-pipeline \
+            -o jsonpath='{.status.sync.status} {.status.health.status}{"\n"}'
+          kubectl get nodepools.karpenter.sh
+          kubectl get ec2nodeclass default -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+          kubectl get nodes -l capacity=on-demand
+          kubectl -n sales-pipeline get pods -o wide
+          kubectl -n sales-pipeline get sa api worker \
+            -o jsonpath='{range .items[*]}{.metadata.name}: {.metadata.annotations.eks\.amazonaws\.com/role-arn}{"\n"}{end}'
+        Check: Synced Healthy; NodePools on-demand and spot; True; at least one on-demand
+        node (two, one per zone, once the spread is honoured); three api pods Running and no
+        worker pod (KEDA keeps it at zero while the queue is empty); api and worker each show
+        their own IRSA role ARN.
+        If api pods show CrashLoopBackOff with 'role "app_api" does not exist': step 41 did
+        not run; run it and the pods recover on their next restart.
+        If api pods stay Pending for long: Karpenter cannot launch; the managed nodes already
+        use 16 On-Demand vCPUs and the first sync needs about 6 more across two nodes, so
+        step 33's command must print at least 22, and `kubectl get events -A
+        --field-selector type=Warning` shows VcpuLimitExceeded if it does not.
+        If both Deployments show ImagePullBackOff: the pinned SHA has no image in ECR (step
+        45's check).
+        More: RUNBOOK, Phase 3 (ORDERING, iv); RUNBOOK, "First-apply watch list";
+        k8s/README.md, "Apply"
+
+=====================================================================================
+STAGE 6 - TEST IT END TO END
+=====================================================================================
+
+[ ] 52. Submit a batch through the private API and read its result. Third terminal:
+          kubectl -n sales-pipeline port-forward svc/api 8000:8000
+        Fourth terminal:
+          curl -X POST localhost:8000/jobs -H 'content-type: application/json' \
+            -d '{"records":[{"region":"West","amount":100,"sale_date":"2026-01-01","order_id":"a1"}]}'
+          curl localhost:8000/jobs/<job_id>
+          curl localhost:8000/jobs/<job_id>/result
+        Check: the POST returns 202 with a job_id and status pending; the status endpoint
+        reaches done; the result endpoint returns the aggregates.
+        More: k8s/README.md, "Testing the API"; docs/DESIGN.md, "How data flows, and the
+        tradeoffs behind it"
+
+[ ] 53. While that batch is queued, watch the worker scale from zero onto a Spot node, then
+        confirm the DLQ alarm stayed OK. Run the first two commands right after the POST
+        (POST another batch if you missed the window).
+          kubectl -n sales-pipeline get pods -l app=worker
+          kubectl get nodes -l capacity=spot
+          aws cloudwatch describe-alarms --alarm-names sales-pipeline-dlq-not-empty \
+            --query 'MetricAlarms[0].StateValue' --output text
+        Check: a worker pod appears and runs on a node labelled capacity=spot; some minutes
+        after the queue drains the worker is gone again; the alarm prints OK.
+        If api runs but the worker stays Pending: Spot cannot launch; `kubectl get events -A
+        --field-selector type=Warning | grep ServiceLinkedRole` points at step 12.
+        More: RUNBOOK, "First-apply watch list"; docs/DESIGN.md, "How it scales, and why
+        those specific signals"
+
+[ ] 54. Open Grafana and confirm the app is being scraped.
+          kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
+        Then http://localhost:3000, user admin, password <GRAFANA_PASSWORD>; in Explore, run
+        the Prometheus query  up{namespace="sales-pipeline"}  .
+        Check: login works and the query returns 1 for each api pod.
+        If the scheduler, controller-manager, etcd and kube-proxy dashboards are empty:
+        expected; EKS exposes none of those targets.
+        More: k8s/README.md, "Observability (Prometheus / Grafana)"; RUNBOOK, "First-apply
+        watch list"
