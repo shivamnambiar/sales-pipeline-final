@@ -15,11 +15,11 @@
   <a href="#license">License</a>
 </p>
 
----
+
 <p align="center">
   <img src="./images/sales_pipeline_diagram.svg" width="800"/>
 </p>
----
+
 
 ## Status
 
