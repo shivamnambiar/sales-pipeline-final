@@ -325,7 +325,7 @@ The API's 50,000-records-per-batch cap and the worker's 15 MiB object cap come f
 ├── smoke.sh                         # e2e against compose: mixed batch in, expected totals out
 ├── RUNBOOK.md                       # empty account → running system → teardown, with the first-apply watch list
 ├── CLAUDE.md                        # working agreement for AI-assisted sessions: read-only loop, denied commands, settled decisions
-└── *.txt                            # static audits (tf-audit, preflight), first-deploy notes, overview.txt (per-file index)
+└── *.txt                            # first-deploy notes, overview.txt
 ```
 
 ---
