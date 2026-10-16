@@ -409,4 +409,4 @@ The tests are plain scripts with no network or AWS calls, the same invocation lo
 ---
 ## License
 
-No license file is included yet.
+MIT — see [LICENSE](LICENSE) for details.
