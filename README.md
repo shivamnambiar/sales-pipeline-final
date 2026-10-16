@@ -11,7 +11,6 @@
   <a href="#deployment">Deployment</a> •
   <a href="#cicd">CI/CD</a> •
   <a href="#local-development">Local Development</a> •
-  <a href="#what-id-improve-in-production">What I'd Improve</a> •
   <a href="#license">License</a>
 </p>
 
